@@ -2,6 +2,8 @@
 # cask - Standalone Homebrew-free macOS GUI app installer & updater for Intel Macs.
 import sys, urllib.request, json, os, re, glob, shutil, subprocess, tempfile
 
+CLI_USER_AGENT = "intel-cask/1.0 (Macintosh; Intel Mac OS X; x86_64) curl/8.0"
+
 def run_cmd(cmd, **kwargs):
     try:
         with open("/dev/tty", "rb") as tty:
@@ -67,7 +69,7 @@ def get_cask_data(cask):
         return parse_local_rb(expanded_rb)
 
     if cask == "newkap":
-        req = urllib.request.Request("https://api.github.com/repos/MuntasirMalek/NewKap/releases/latest", headers={"User-Agent": "Mozilla/5.0"})
+        req = urllib.request.Request("https://api.github.com/repos/MuntasirMalek/NewKap/releases/latest", headers={"User-Agent": CLI_USER_AGENT})
         with urllib.request.urlopen(req, timeout=15) as resp:
             rel = json.loads(resp.read().decode())
         dl_url = None
@@ -80,7 +82,7 @@ def get_cask_data(cask):
 
     url = f"https://formulae.brew.sh/api/cask/{cask}.json"
     try:
-        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        req = urllib.request.Request(url, headers={"User-Agent": CLI_USER_AGENT})
         with urllib.request.urlopen(req, timeout=15) as resp:
             return json.loads(resp.read().decode())
     except Exception:
@@ -110,14 +112,10 @@ def get_intel_url_and_artifacts(data):
     return dl_url, artifacts
 
 def detect_kind(filepath):
-    lower = filepath.lower()
-    if lower.endswith(".dmg"): return "dmg"
-    if lower.endswith((".pkg", ".mpkg")): return "pkg"
-    if lower.endswith(".zip"): return "zip"
-    if lower.endswith((".tar.gz", ".tgz", ".tar.bz2", ".tbz2", ".tar.xz", ".txz", ".tar")): return "tar"
-
     with open(filepath, "rb") as f:
-        magic = f.read(8)
+        magic = f.read(512)
+    if magic.lstrip().startswith((b"<!DOCTYPE", b"<!doctype", b"<html", b"<HTML")):
+        return "html"
     if magic.startswith(b"PK\x03\x04"): return "zip"
     if magic.startswith(b"xar!"): return "pkg"
     if magic.startswith((b"\x1f\x8b", b"BZh", b"\xfd7zXZ")): return "tar"
@@ -125,6 +123,12 @@ def detect_kind(filepath):
     res = subprocess.run(["hdiutil", "imageinfo", filepath], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     if res.returncode == 0:
         return "dmg"
+
+    lower = filepath.lower()
+    if lower.endswith(".dmg"): return "dmg"
+    if lower.endswith((".pkg", ".mpkg")): return "pkg"
+    if lower.endswith(".zip"): return "zip"
+    if lower.endswith((".tar.gz", ".tgz", ".tar.bz2", ".tbz2", ".tar.xz", ".txz", ".tar")): return "tar"
     return "binary"
 
 def copy_app(src, dst):
@@ -178,8 +182,9 @@ def install_extracted(search_dir, cask, artifacts):
                 if f.lower().endswith((".pkg", ".mpkg")):
                     pkg_path = os.path.join(root, f)
                     print(f"📦 Running package installer for {f}...")
-                    run_cmd(["sudo", "installer", "-pkg", pkg_path, "-target", "/"])
-                    installed_any = True
+                    res = run_cmd(["sudo", "installer", "-pkg", pkg_path, "-target", "/"])
+                    if res.returncode == 0:
+                        installed_any = True
 
     for artifact in artifacts:
         if isinstance(artifact, dict) and "binary" in artifact:
@@ -216,6 +221,11 @@ def install_extracted(search_dir, cask, artifacts):
                         link_binary(os.path.join(r, rel_name), target_name)
                         break
 
+    return installed_any
+
+def download_file(url, out_path):
+    return run_cmd(["curl", "-fL#", "-A", CLI_USER_AGENT, url, "-o", out_path])
+
 def install_cask(cask_arg):
     data = get_cask_data(cask_arg)
     if not data:
@@ -244,13 +254,37 @@ def install_cask(cask_arg):
     raw_name = dl_url.split("?")[0].rstrip("/").split("/")[-1] or f"{cask}_dl"
     dl_path = os.path.join(tmp_dir, raw_name)
 
-    res = run_cmd(["curl", "-fL#", "-A", "Mozilla/5.0", dl_url, "-o", dl_path])
+    res = download_file(dl_url, dl_path)
     if res.returncode != 0 or not os.path.exists(dl_path):
         print(f"❌ Failed to download '{cask}'.")
         shutil.rmtree(tmp_dir, ignore_errors=True)
         return
 
     kind = detect_kind(dl_path)
+
+    # If the download served an HTML landing/redirect page, extract the actual mirror URL
+    if kind == "html":
+        print("🔍 Extracting mirror link from redirect page...")
+        with open(dl_path, "r", encoding="utf-8", errors="ignore") as f:
+            html_text = f.read()
+        
+        # Check for HTML meta-refresh URL first
+        meta_m = re.search(r'URL=[\'"]?([^\'">\s]+)', html_text, re.IGNORECASE)
+        href_m = re.findall(r'href=["\x27](https?://[^"\x27]+\.(?:dmg|pkg|zip|tar\.gz))["\x27]', html_text)
+        
+        resolved_url = meta_m.group(1) if meta_m else (href_m[0] if href_m else None)
+        if resolved_url:
+            print(f"⬇️  Redirecting to: {resolved_url}")
+            os.remove(dl_path)
+            res = download_file(resolved_url, dl_path)
+            kind = detect_kind(dl_path)
+        else:
+            print("❌ Download URL served an HTML landing page without a direct binary link.")
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+            return
+
+    installed_successfully = False
+
     if kind == "dmg":
         mount_root = os.path.join(tmp_dir, "mnt")
         os.makedirs(mount_root, exist_ok=True)
@@ -261,7 +295,7 @@ def install_cask(cask_arg):
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL
         )
-        install_extracted(mount_root, cask, artifacts)
+        installed_successfully = install_extracted(mount_root, cask, artifacts)
         for entry in os.listdir(mount_root):
             mp = os.path.join(mount_root, entry)
             if os.path.ismount(mp) or os.path.isdir(mp):
@@ -270,38 +304,41 @@ def install_cask(cask_arg):
         extract_dir = os.path.join(tmp_dir, "extracted")
         print("📂 Extracting ZIP archive...")
         subprocess.run(["ditto", "-x", "-k", dl_path, extract_dir])
-        install_extracted(extract_dir, cask, artifacts)
+        installed_successfully = install_extracted(extract_dir, cask, artifacts)
     elif kind == "tar":
         extract_dir = os.path.join(tmp_dir, "extracted")
         os.makedirs(extract_dir, exist_ok=True)
         print("📂 Extracting TAR archive...")
         subprocess.run(["tar", "-xf", dl_path, "-C", extract_dir])
-        install_extracted(extract_dir, cask, artifacts)
+        installed_successfully = install_extracted(extract_dir, cask, artifacts)
     elif kind == "pkg":
         pkg_file = dl_path if dl_path.lower().endswith((".pkg", ".mpkg")) else dl_path + ".pkg"
         if pkg_file != dl_path:
             os.rename(dl_path, pkg_file)
         print("📦 Running PKG installer...")
-        run_cmd(["sudo", "installer", "-pkg", pkg_file, "-target", "/"])
+        pkg_res = run_cmd(["sudo", "installer", "-pkg", pkg_file, "-target", "/"])
+        installed_successfully = (pkg_res.returncode == 0)
     elif kind == "binary":
         extract_dir = os.path.join(tmp_dir, "bin_stage")
         os.makedirs(extract_dir, exist_ok=True)
         shutil.move(dl_path, os.path.join(extract_dir, raw_name))
-        install_extracted(extract_dir, cask, artifacts)
+        installed_successfully = install_extracted(extract_dir, cask, artifacts)
 
     shutil.rmtree(tmp_dir, ignore_errors=True)
 
-    tracker = os.path.expanduser("~/.installed_casks.txt")
-    existing = []
-    if os.path.exists(tracker):
-        with open(tracker, "r") as f:
-            existing = [line.strip() for line in f if line.strip()]
-    if cask not in existing and not cask_arg.endswith(".rb"):
-        existing.append(cask)
-        with open(tracker, "w") as f:
-            f.write("\n".join(existing) + "\n")
-
-    print(f"✅ Successfully installed '{cask}'!\n")
+    if installed_successfully:
+        tracker = os.path.expanduser("~/.installed_casks.txt")
+        existing = []
+        if os.path.exists(tracker):
+            with open(tracker, "r") as f:
+                existing = [line.strip() for line in f if line.strip()]
+        if cask not in existing and not cask_arg.endswith(".rb"):
+            existing.append(cask)
+            with open(tracker, "w") as f:
+                f.write("\n".join(existing) + "\n")
+        print(f"✅ Successfully installed '{cask}'!\n")
+    else:
+        print(f"❌ Failed to install '{cask}'. No application bundle was transferred to /Applications.\n")
 
 def info_cask(cask_arg):
     data = get_cask_data(cask_arg)
