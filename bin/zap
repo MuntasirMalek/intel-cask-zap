@@ -1,0 +1,148 @@
+#!/usr/bin/env python3
+# zap - Standalone deep uninstaller for macOS GUI applications.
+import sys, urllib.request, json, os, glob, shutil, subprocess
+
+def run_cmd(cmd, **kwargs):
+    try:
+        with open("/dev/tty", "rb") as tty:
+            return subprocess.run(cmd, stdin=tty, **kwargs)
+    except Exception:
+        return subprocess.run(cmd, **kwargs)
+
+def to_list(val):
+    if isinstance(val, list):
+        return val
+    return [val] if val else []
+
+def get_zap_data(cask):
+    if cask == "newkap":
+        return {
+            "artifacts": [
+                {"app": ["NewKap.app"]},
+                {"zap": [{"quit": "com.wulkano.kap", "trash": [
+                    "~/Library/Application Support/NewKap",
+                    "~/Library/Application Support/Kap",
+                    "~/Library/Preferences/com.wulkano.kap.plist",
+                    "~/Library/Caches/com.wulkano.kap",
+                    "~/Library/Caches/com.wulkano.kap.ShipIt",
+                    "~/Library/Saved Application State/com.wulkano.kap.savedState"
+                ]}]}
+            ]
+        }
+    url = f"https://formulae.brew.sh/api/cask/{cask}.json"
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return json.loads(resp.read().decode())
+    except Exception:
+        return None
+
+def remove_path(p):
+    uid = str(os.getuid())
+    p = p.replace("$(id -u)", uid).replace("$APPDIR", "/Applications").replace("$HOMEBREW_PREFIX", "/usr/local")
+    expanded = os.path.expanduser(p)
+    matches = glob.glob(expanded)
+    if not matches and os.path.lexists(expanded):
+        matches = [expanded]
+    for m in matches:
+        if m in ("/", "/Applications", "/Library", os.path.expanduser("~"), os.path.expanduser("~/Library")):
+            continue
+        print(f"🗑️  Removing: {m}")
+        try:
+            if os.path.isdir(m) and not os.path.islink(m):
+                shutil.rmtree(m)
+            else:
+                os.remove(m)
+        except PermissionError:
+            run_cmd(["sudo", "rm", "-rf", m])
+        except Exception as e:
+            print(f"⚠️  Could not remove {m}: {e}")
+
+def zap_cask(cask):
+    data = get_zap_data(cask)
+    if not data:
+        print(f"❌ Could not find '{cask}' in the online Cask database.")
+        return
+
+    print(f"⚡ Zapping '{cask}'...")
+    artifacts = list(data.get("artifacts", []))
+    variations = data.get("variations", {})
+    for os_key in ["golden_gate", "tahoe", "sequoia", "sonoma", "ventura", "monterey", "big_sur", "x86_64"]:
+        if os_key in variations and "artifacts" in variations[os_key]:
+            artifacts = list(variations[os_key]["artifacts"])
+            break
+
+    for artifact in artifacts:
+        if not isinstance(artifact, dict):
+            continue
+        if "app" in artifact:
+            for item in to_list(artifact["app"]):
+                app_name = item.get("target") if isinstance(item, dict) else (item if isinstance(item, str) else None)
+                if app_name:
+                    app_base = os.path.basename(app_name)
+                    app_id_name = app_base[:-4] if app_base.endswith(".app") else app_base
+                    run_cmd(["osascript", "-e", f'tell application "{app_id_name}" to quit'], stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
+                    remove_path(f"/Applications/{app_base}")
+                    remove_path(f"~/Applications/{app_base}")
+
+        if "binary" in artifact:
+            items = to_list(artifact["binary"])
+            if items and isinstance(items[0], str):
+                src_bin = items[0]
+                target_name = os.path.basename(src_bin)
+                if len(items) > 1 and isinstance(items[1], dict) and "target" in items[1]:
+                    target_name = os.path.basename(items[1]["target"])
+                remove_path(f"/usr/local/bin/{target_name}")
+
+        for stage in ("uninstall", "zap"):
+            if stage in artifact:
+                for step in to_list(artifact[stage]):
+                    if not isinstance(step, dict):
+                        continue
+                    for q in to_list(step.get("quit", [])):
+                        if isinstance(q, str):
+                            run_cmd(["osascript", "-e", f'tell application id "{q}" to quit'], stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
+                    for sig in to_list(step.get("signal", [])):
+                        if isinstance(sig, list) and len(sig) == 2:
+                            run_cmd(["pkill", f"-{sig[0]}", "-f", str(sig[1])], stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
+                    for lc in to_list(step.get("launchctl", [])):
+                        if isinstance(lc, str):
+                            print(f"🛑 Stopping service: {lc}")
+                            run_cmd(["launchctl", "remove", lc], stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
+                            run_cmd(["sudo", "launchctl", "remove", lc], stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
+                    for key in ("trash", "delete"):
+                        for p in to_list(step.get(key, [])):
+                            if isinstance(p, str):
+                                remove_path(p)
+                    for pkg in to_list(step.get("pkgutil", [])):
+                        if isinstance(pkg, str):
+                            print(f"📦 Forgetting package receipt: {pkg}")
+                            res = subprocess.run(["pkgutil", "--pkgs=" + pkg], capture_output=True, text=True)
+                            matched_pkgs = [line.strip() for line in res.stdout.splitlines() if line.strip()] or [pkg]
+                            for mp in matched_pkgs:
+                                run_cmd(["sudo", "pkgutil", "--forget", mp], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    for rd in to_list(step.get("rmdir", [])):
+                        if isinstance(rd, str):
+                            expanded = os.path.expanduser(rd)
+                            if os.path.isdir(expanded) and not os.listdir(expanded):
+                                remove_path(expanded)
+
+    remove_path(f"/usr/local/Caskroom/{cask}")
+    tracker = os.path.expanduser("~/.installed_casks.txt")
+    if os.path.exists(tracker):
+        with open(tracker, "r") as f:
+            lines = [line.strip() for line in f if line.strip() and line.strip() != cask]
+        with open(tracker, "w") as f:
+            f.write("\n".join(lines) + ("\n" if lines else ""))
+
+    print(f"✅ Successfully zapped '{cask}'!\n")
+
+def main():
+    if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help"):
+        print("Usage: zap <app-cask-name> [app2 ...]")
+        sys.exit(0 if len(sys.argv) >= 2 else 1)
+    for cask in sys.argv[1:]:
+        zap_cask(cask)
+
+if __name__ == "__main__":
+    main()
