@@ -12,10 +12,12 @@ With Homebrew 7.0.0 dropping Intel macOS bottle CI and recommending MacPorts for
 
 - 100% Homebrew-Free: Built-in Python 3 and native macOS tools.
 - Architecture Resolver: Automatically selects Intel/Universal packages.
+- Smart Install & Skip: Detects and skips already-installed apps; supports `cask reinstall` and `--force`.
 - Format Support: Handles DMG, PKG, ZIP, TAR, redirect URLs, and raw binaries.
 - Auto CLI Symlinking: Links app CLI binaries to `/usr/local/bin`.
 - Quarantine Strip: Removes Gatekeeper quarantine attributes (`xattr -cr`).
-- Complete Zap Uninstaller: Cleans apps, launchctl services, pkgutil receipts, and `~/Library` caches.
+- Safe & Complete Zap: Closes running apps safely without launching closed apps, then uninstalls files, launchctl services, pkgutil receipts, and `~/Library` caches.
+- Disk Cleanup: Built-in `cask cleanup` to purge leftover temporary downloads and orphaned caches.
 
 ## Quick Install
 
@@ -25,8 +27,12 @@ With Homebrew 7.0.0 dropping Intel macOS bottle CI and recommending MacPorts for
 
 ## Usage
 
-    # Install GUI apps
+    # Install GUI apps (skips if already installed)
     cask install google-chrome vlc visual-studio-code
+
+    # Force reinstall apps
+    cask reinstall vlc
+    cask install --force vlc
 
     # Inspect Cask details and Intel download URL
     cask info visual-studio-code
@@ -36,6 +42,9 @@ With Homebrew 7.0.0 dropping Intel macOS bottle CI and recommending MacPorts for
 
     # Upgrade all tracked casks
     cask upgrade-all
+
+    # Clean up leftover temporary downloads and orphaned caches
+    cask cleanup
 
     # Deep uninstall app and all cache/preference files
     zap google-chrome

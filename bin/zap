@@ -1,18 +1,72 @@
 #!/usr/bin/env python3
 # zap - Standalone deep uninstaller for macOS GUI applications.
-import sys, urllib.request, json, os, glob, shutil, subprocess
+import sys, urllib.request, json, os, glob, shutil, subprocess, time
 
 def run_cmd(cmd, **kwargs):
-    try:
-        with open("/dev/tty", "rb") as tty:
-            return subprocess.run(cmd, stdin=tty, **kwargs)
-    except Exception:
-        return subprocess.run(cmd, **kwargs)
+    if cmd and cmd[0] == "sudo":
+        try:
+            with open("/dev/tty", "rb") as tty:
+                return subprocess.run(cmd, stdin=tty, **kwargs)
+        except Exception:
+            return subprocess.run(cmd, **kwargs)
+    return subprocess.run(cmd, **kwargs)
 
 def to_list(val):
     if isinstance(val, list):
         return val
     return [val] if val else []
+
+def is_process_running(target):
+    if not target:
+        return False
+    clean = target[:-4] if target.endswith(".app") else target
+    res = subprocess.run(["pgrep", "-f", clean], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return res.returncode == 0
+
+def quit_app(app_name=None, bundle_id=None):
+    """
+    Safely terminates an application ONLY if it is currently running.
+    Never launches closed applications through AppleScript!
+    """
+    target = bundle_id or app_name
+    if not target:
+        return
+
+    # If the process isn't running, do NOT touch AppleScript or LaunchServices!
+    if not is_process_running(target):
+        return
+
+    print(f"🛑 Quitting running application: {target}...")
+    if bundle_id:
+        try:
+            subprocess.run(
+                ["osascript", "-e", f'if application id "{bundle_id}" is running then tell application id "{bundle_id}" to quit'],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5
+            )
+        except Exception:
+            pass
+    elif app_name:
+        clean = app_name[:-4] if app_name.endswith(".app") else app_name
+        try:
+            subprocess.run(
+                ["osascript", "-e", f'if application "{clean}" is running then tell application "{clean}" to quit'],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5
+            )
+        except Exception:
+            pass
+
+    # Wait briefly for graceful shutdown
+    for _ in range(4):
+        if not is_process_running(target):
+            return
+        time.sleep(0.5)
+
+    # Force kill if still lingering
+    clean = target[:-4] if target.endswith(".app") else target
+    subprocess.run(["pkill", "-TERM", "-f", clean], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    time.sleep(0.3)
+    if is_process_running(target):
+        subprocess.run(["pkill", "-KILL", "-f", clean], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 def get_zap_data(cask):
     if cask == "newkap":
@@ -72,16 +126,44 @@ def zap_cask(cask):
             artifacts = list(variations[os_key]["artifacts"])
             break
 
+    # Pass 1: Gracefully quit applications and stop launchctl daemons/services before deleting
     for artifact in artifacts:
         if not isinstance(artifact, dict):
             continue
+
+        if "app" in artifact:
+            for item in to_list(artifact["app"]):
+                app_name = item.get("target") if isinstance(item, dict) else (item if isinstance(item, str) else None)
+                if app_name:
+                    quit_app(app_name=os.path.basename(app_name))
+
+        for stage in ("uninstall", "zap"):
+            if stage in artifact:
+                for step in to_list(artifact[stage]):
+                    if not isinstance(step, dict):
+                        continue
+                    for q in to_list(step.get("quit", [])):
+                        if isinstance(q, str):
+                            quit_app(bundle_id=q)
+                    for sig in to_list(step.get("signal", [])):
+                        if isinstance(sig, list) and len(sig) == 2:
+                            run_cmd(["pkill", f"-{sig[0]}", "-f", str(sig[1])], stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
+                    for lc in to_list(step.get("launchctl", [])):
+                        if isinstance(lc, str):
+                            print(f"🛑 Stopping service: {lc}")
+                            run_cmd(["launchctl", "remove", lc], stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
+                            run_cmd(["sudo", "launchctl", "remove", lc], stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
+
+    # Pass 2: Remove app bundles, binaries, receipts, and files
+    for artifact in artifacts:
+        if not isinstance(artifact, dict):
+            continue
+
         if "app" in artifact:
             for item in to_list(artifact["app"]):
                 app_name = item.get("target") if isinstance(item, dict) else (item if isinstance(item, str) else None)
                 if app_name:
                     app_base = os.path.basename(app_name)
-                    app_id_name = app_base[:-4] if app_base.endswith(".app") else app_base
-                    run_cmd(["osascript", "-e", f'tell application "{app_id_name}" to quit'], stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
                     remove_path(f"/Applications/{app_base}")
                     remove_path(f"~/Applications/{app_base}")
 
@@ -99,17 +181,6 @@ def zap_cask(cask):
                 for step in to_list(artifact[stage]):
                     if not isinstance(step, dict):
                         continue
-                    for q in to_list(step.get("quit", [])):
-                        if isinstance(q, str):
-                            run_cmd(["osascript", "-e", f'tell application id "{q}" to quit'], stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
-                    for sig in to_list(step.get("signal", [])):
-                        if isinstance(sig, list) and len(sig) == 2:
-                            run_cmd(["pkill", f"-{sig[0]}", "-f", str(sig[1])], stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
-                    for lc in to_list(step.get("launchctl", [])):
-                        if isinstance(lc, str):
-                            print(f"🛑 Stopping service: {lc}")
-                            run_cmd(["launchctl", "remove", lc], stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
-                            run_cmd(["sudo", "launchctl", "remove", lc], stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
                     for key in ("trash", "delete"):
                         for p in to_list(step.get(key, [])):
                             if isinstance(p, str):
