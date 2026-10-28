@@ -16,5 +16,6 @@ else
 fi
 
 chmod +x /usr/local/bin/cask /usr/local/bin/zap
-echo "✅ Installed /usr/local/bin/cask and /usr/local/bin/zap!"
+ln -sf /usr/local/bin/cask /usr/local/bin/casks
+echo "✅ Installed /usr/local/bin/cask (alias: casks) and /usr/local/bin/zap!"
 echo "👉 Run 'cask --help' or 'cask install vlc' to get started."
