@@ -1,24 +1,28 @@
 #!/usr/bin/env python3
 # cask - Standalone Homebrew-free macOS GUI app & CLI formula installer for Intel Macs.
-import sys, urllib.request, json, os, re, glob, shutil, subprocess, tempfile, plistlib
+import sys, urllib.request, urllib.parse, html, json, os, re, glob, shutil, subprocess, tempfile, plistlib, platform, hashlib, shlex
 
 CLI_USER_AGENT = "intel-cask/1.0 (Macintosh; Intel Mac OS X; x86_64) curl/8.0"
+BROWSER_USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 
-INTEL_OS_KEYS = [
+MACOS_ORDER = [
     "golden_gate", "tahoe", "sequoia", "sonoma", "ventura",
-    "monterey", "big_sur", "catalina", "mojave", "high_sierra",
-    "x86_64", "all"
+    "monterey", "big_sur", "catalina", "mojave", "high_sierra"
 ]
 
+INTEL_OS_KEYS = MACOS_ORDER + ["x86_64", "all"]
+
 EXCLUDED_ASSET_EXTS = (
-    ".sha256", ".sha512", ".sig", ".asc", ".sbom", ".blockmap",
+    ".sha256", ".sha256sum", ".sha512", ".sha512sum", ".md5", ".checksums",
+    ".sig", ".asc", ".minisig", ".pem", ".pub", ".sbom", ".blockmap",
     ".yml", ".yaml", ".json", ".txt", ".deb", ".rpm", ".appimage",
-    ".exe", ".msi", ".apk", ".zst", ".msix", ".nupkg"
+    ".exe", ".msi", ".apk", ".zst", ".msix", ".nupkg", ".dsym.zip", ".pdb"
 )
 
 EXCLUDED_BIN_DIRS = {
     "share", "man", "doc", "docs", "completions", "completion",
-    "include", "etc", "lib", "pkgconfig", "zsh", "bash", "fish"
+    "include", "etc", "lib", "pkgconfig", "zsh", "bash", "fish",
+    "test", "tests", "example", "examples"
 }
 
 EXCLUDED_BIN_EXTS = (
@@ -26,6 +30,53 @@ EXCLUDED_BIN_EXTS = (
     ".rb", ".1", ".2", ".3", ".4", ".5", ".6", ".7", ".8",
     ".bash", ".zsh", ".fish", ".ps1", ".html", ".css", ".png", ".svg"
 )
+
+BUNDLE_DIR_EXTS = (".app", ".framework", ".bundle", ".xcframework", ".dsym")
+
+MACHO_MAGICS = (
+    b"\xcf\xfa\xed\xfe", b"\xfe\xed\xfa\xcf",
+    b"\xce\xfa\xed\xfe", b"\xfe\xed\xfa\xce",
+    b"\xca\xfe\xba\xbe", b"\xbe\xba\xfe\xca"
+)
+
+def get_host_macos_codename():
+    ver = platform.mac_ver()[0]
+    if ver:
+        parts = ver.split(".")
+        try:
+            major = int(parts[0])
+            minor = int(parts[1]) if len(parts) > 1 else 0
+            if major >= 27:
+                return "golden_gate"
+            if major == 26:
+                return "tahoe"
+            if major == 15:
+                return "sequoia"
+            if major == 14:
+                return "sonoma"
+            if major == 13:
+                return "ventura"
+            if major == 12:
+                return "monterey"
+            if major == 11:
+                return "big_sur"
+            if major == 10:
+                if minor >= 15:
+                    return "catalina"
+                if minor == 14:
+                    return "mojave"
+                if minor == 13:
+                    return "high_sierra"
+        except ValueError:
+            pass
+    return "sequoia"
+
+def get_host_fallback_order(host_os=None):
+    host_os = host_os or get_host_macos_codename()
+    if host_os in MACOS_ORDER:
+        idx = MACOS_ORDER.index(host_os)
+        return [host_os] + MACOS_ORDER[idx + 1:] + list(reversed(MACOS_ORDER[:idx])) + ["x86_64", "all"]
+    return list(INTEL_OS_KEYS)
 
 def run_cmd(cmd, **kwargs):
     if cmd and cmd[0] == "sudo":
@@ -41,6 +92,32 @@ def to_list(val):
         return val
     return [val] if val else []
 
+def expand_cask_path(p):
+    uid = str(os.getuid())
+    home = os.path.expanduser("~")
+    p = p.replace("$(id -u)", uid)
+    p = p.replace("$HOMEBREW_PREFIX", "/usr/local").replace("$APPDIR", "/Applications")
+    p = re.sub(r"/?\$HOME(?![A-Za-z0-9_])", lambda _: home, p)
+    return os.path.expanduser(p)
+
+def is_arm_only_depends(dep):
+    if not isinstance(dep, dict):
+        return False
+    arch = dep.get("arch")
+    if not arch:
+        return False
+    items = arch if isinstance(arch, list) else [arch]
+    types = {a.get("type") for a in items if isinstance(a, dict) and "type" in a}
+    return "arm" in types and "intel" not in types
+
+def is_arm_only_url(url):
+    if not url:
+        return False
+    low = urllib.parse.unquote(url).lower()
+    has_arm = bool(re.search(r"(?<![a-z0-9])(arm64|aarch64|apple[-_]?silicon|mac[-_]?apple)(?![a-z0-9])", low)) or bool(re.search(r"(macaarch64|arm64)", low))
+    has_intel_or_univ = bool(re.search(r"(?<![a-z0-9])(x86[-_]?64|x64|amd64|intel|intel64|universal|mac64)(?![a-z0-9])", low)) or any(t in low for t in ("x86_64", "intelarm64", "arm64intel"))
+    return has_arm and not has_intel_or_univ
+
 def parse_local_rb(rb_path):
     with open(rb_path, "r") as f:
         raw_content = f.read()
@@ -52,40 +129,53 @@ def parse_local_rb(rb_path):
     arch_m = re.search(r'arch\s+.*?intel:\s*["\x27]([^"\x27]+)["\x27]', content)
     intel_arch = arch_m.group(1) if arch_m else "x86_64"
 
-    intel_block = re.search(r'on_intel\s+do(.*?)end', content, re.DOTALL)
+    intel_block = re.search(r'on_intel\s+do\b(.*?)\bend\b', content, re.DOTALL)
     sub = intel_block.group(1) if intel_block else content
 
     ver_m = re.search(r'version\s+["\x27]([^"\x27]+)["\x27]', sub) or re.search(r'version\s+["\x27]([^"\x27]+)["\x27]', content)
     version = ver_m.group(1) if ver_m else ""
     parts = version.split(",")
+    ver_nums = parts[0].split(".") if parts and parts[0] else []
+    major_minor = ".".join(ver_nums[:2]) if len(ver_nums) >= 2 else (parts[0] if parts else "")
+
+    def interp(val):
+        val = val.replace("#{version.csv.first}", parts[0] if parts else "")
+        if len(parts) > 1:
+            val = val.replace("#{version.csv.second}", parts[1])
+        if len(parts) > 2:
+            val = val.replace("#{version.csv.third}", parts[2])
+        val = val.replace("#{version.major_minor}", major_minor)
+        val = val.replace("#{version}", version)
+        val = re.sub(r'#\{arch\}', intel_arch, val)
+        return val
 
     url_m = re.search(r'url\s+["\x27]([^"\x27]+)["\x27]', sub) or re.search(r'url\s+["\x27]([^"\x27]+)["\x27]', content)
     if not url_m:
         return None
-    url = url_m.group(1)
-    url = url.replace("#{version.csv.first}", parts[0] if parts else "")
-    if len(parts) > 1:
-        url = url.replace("#{version.csv.second}", parts[1])
-    if len(parts) > 2:
-        url = url.replace("#{version.csv.third}", parts[2])
-    url = url.replace("#{version}", version)
-    url = re.sub(r'#\{arch\}', intel_arch, url)
+    url = interp(url_m.group(1))
 
-    apps = re.findall(r'\bapp\s+["\x27]([^"\x27]+)["\x27]', content)
+    sha_m = re.search(r'sha256\s+(?:intel:\s*)?["\x27]([0-9a-fA-F]{64})["\x27]', sub) or re.search(r'sha256\s+intel:\s*["\x27]([0-9a-fA-F]{64})["\x27]', content)
+    sha256 = sha_m.group(1) if sha_m else None
+
+    apps = re.findall(r'\bapp\s+["\x27]([^"\x27]+)["\x27](?:\s*,\s*target:\s*["\x27]([^"\x27]+)["\x27])?', content)
     pkgs = re.findall(r'\bpkg\s+["\x27]([^"\x27]+)["\x27]', content)
     bins = re.findall(r'\bbinary\s+["\x27]([^"\x27]+)["\x27](?:\s*,\s*target:\s*["\x27]([^"\x27]+)["\x27])?', content)
     artifacts = []
-    if apps:
-        artifacts.append({"app": apps})
+    for src_app, target_app in apps:
+        src_app = interp(src_app)
+        if target_app:
+            artifacts.append({"app": [src_app, {"target": interp(target_app)}]})
+        else:
+            artifacts.append({"app": [src_app]})
     if pkgs:
-        artifacts.append({"pkg": pkgs})
+        artifacts.append({"pkg": [interp(p) for p in pkgs]})
     for src_bin, target_bin in bins:
-        src_bin = src_bin.replace("#{appdir}", "$APPDIR").replace("#{staged_path}", f"/usr/local/Caskroom/{token}")
+        src_bin = interp(src_bin).replace("#{appdir}", "$APPDIR").replace("#{staged_path}/", "").replace("#{staged_path}", "")
         if target_bin:
-            artifacts.append({"binary": [src_bin, {"target": target_bin}]})
+            artifacts.append({"binary": [src_bin, {"target": interp(target_bin)}]})
         else:
             artifacts.append({"binary": [src_bin]})
-    return {"token": token, "version": version, "url": url, "artifacts": artifacts, "variations": {}, "depends_on": {}}
+    return {"token": token, "version": version, "url": url, "sha256": sha256, "artifacts": artifacts, "variations": {}, "depends_on": {}}
 
 def get_github_release_assets(owner, repo, tags=None):
     """
@@ -96,16 +186,20 @@ def get_github_release_assets(owner, repo, tags=None):
     candidate_tags = [t for t in dict.fromkeys(tags or []) if t]
 
     def fetch_expanded(tag):
-        url = f"https://github.com/{owner}/{repo}/releases/expanded_assets/{tag}"
+        quoted_tag = urllib.parse.quote(tag, safe="")
+        url = f"https://github.com/{owner}/{repo}/releases/expanded_assets/{quoted_tag}"
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
         with urllib.request.urlopen(req, timeout=12) as resp:
-            html = resp.read().decode("utf-8", errors="ignore")
-        links = re.findall(r'href=["\x27](/[^"\x27]+/releases/download/[^"\x27]+)["\x27]', html)
+            html_body = resp.read().decode("utf-8", errors="ignore")
+        links = re.findall(r'href=["\x27](/[^"\x27]+/releases/download/[^"\x27]+)["\x27]', html_body)
         if links:
-            assets = [
-                {"name": urllib.request.unquote(l.split("/")[-1]), "browser_download_url": "https://github.com" + l}
-                for l in dict.fromkeys(links)
-            ]
+            assets = []
+            for raw_l in dict.fromkeys(links):
+                clean_l = html.unescape(raw_l)
+                assets.append({
+                    "name": urllib.parse.unquote(clean_l.split("/")[-1]),
+                    "browser_download_url": "https://github.com" + clean_l
+                })
             return tag, assets
         return None, []
 
@@ -125,7 +219,7 @@ def get_github_release_assets(owner, repo, tags=None):
             final_url = resp.geturl()
         m = re.search(r"/releases/tag/([^/?#]+)", final_url)
         if m:
-            latest_tag = urllib.request.unquote(m.group(1))
+            latest_tag = urllib.parse.unquote(m.group(1))
             if latest_tag not in candidate_tags:
                 found_tag, assets = fetch_expanded(latest_tag)
                 if assets:
@@ -139,7 +233,10 @@ def get_github_release_assets(owner, repo, tags=None):
     if gh_token:
         headers["Authorization"] = f"Bearer {gh_token}"
 
-    api_urls = [f"https://api.github.com/repos/{owner}/{repo}/releases/tags/{t}" for t in candidate_tags]
+    api_urls = [
+        f"https://api.github.com/repos/{owner}/{repo}/releases/tags/{urllib.parse.quote(t, safe='')}"
+        for t in candidate_tags
+    ]
     api_urls.append(f"https://api.github.com/repos/{owner}/{repo}/releases/latest")
     for api_url in api_urls:
         try:
@@ -164,19 +261,26 @@ def pick_intel_mac_asset(assets, token="", prefer_cli=False):
             continue
         if lower.endswith(EXCLUDED_ASSET_EXTS):
             continue
-        if re.search(r"(linux|windows|win32|win64|freebsd|openbsd|netbsd|android|ios|msvc|gnu|musl)", lower):
-            continue
-        if re.search(r"(arm64|aarch64|armv|apple[-_]?silicon)", lower):
+        if re.search(r"(?<![a-z0-9])(linux|windows|win32|win64|freebsd|openbsd|netbsd|android|ios|msvc|gnu|musl)(?![a-z0-9])", lower):
             continue
 
-        is_mac_named = bool(re.search(r"(darwin|macos|mac|osx|apple)", lower)) or lower.endswith((".dmg", ".pkg", ".mpkg"))
+        has_arm = bool(re.search(r"(?<![a-z0-9])(arm64|aarch64|armv[0-9]*|apple[-_]?silicon|mac[-_]?apple)(?![a-z0-9])", lower)) or bool(re.search(r"(macaarch64|arm64)", lower))
+        has_intel = bool(re.search(r"(?<![a-z0-9])(x86[-_]?64|x64|amd64|intel|intel64|mac64)(?![a-z0-9])", lower)) or any(t in lower for t in ("x86_64", "intelarm64", "arm64intel"))
+        has_universal = bool(re.search(r"(?<![a-z0-9])(universal|all|any)(?![a-z0-9])", lower))
+
+        if has_arm and not has_intel and not has_universal:
+            continue
+
+        is_mac_named = bool(re.search(r"(?<![a-z])(darwin|macos|mac|osx|apple)(?![a-z])", lower)) or lower.endswith((".dmg", ".pkg", ".mpkg"))
         if not is_mac_named:
             continue
 
         score = 0
-        if re.search(r"(x86_64|x64|amd64|intel)", lower):
+        if has_intel and not has_arm:
             score += 50
-        elif re.search(r"(universal|all|any)", lower):
+        elif has_intel and has_arm:
+            score += 45
+        elif has_universal:
             score += 40
         else:
             score += 10
@@ -194,7 +298,7 @@ def pick_intel_mac_asset(assets, token="", prefer_cli=False):
             elif lower.endswith((".pkg", ".mpkg", ".zip", ".app.tar.gz")):
                 score += 15
 
-        if re.search(r"(baseline|profile|debug|symbols|rosetta)", lower):
+        if re.search(r"(?<![a-z0-9])(baseline|profile|debug|symbols|rosetta)(?![a-z0-9])", lower):
             score -= 20
         if token and token.lower() in lower:
             score += 5
@@ -215,7 +319,8 @@ def fetch_json(url):
         return None
 
 def get_formula_data(formula_name):
-    data = fetch_json(f"https://formulae.brew.sh/api/formula/{formula_name}.json")
+    encoded = urllib.parse.quote(formula_name, safe="@")
+    data = fetch_json(f"https://formulae.brew.sh/api/formula/{encoded}.json")
     if not data:
         return None
 
@@ -224,6 +329,7 @@ def get_formula_data(formula_name):
     stable_url = data.get("urls", {}).get("stable", {}).get("url", "")
     homepage = data.get("homepage", "")
     dl_url = None
+    expected_sha256 = None
 
     # 1. Check GitHub Releases for a prebuilt Intel macOS binary/archive
     gh_match = re.search(r"github\.com/([^/]+)/([^/#?]+)", stable_url) or re.search(r"github\.com/([^/]+)/([^/#?]+)", homepage)
@@ -237,23 +343,28 @@ def get_formula_data(formula_name):
         if version:
             tags_to_try.extend([f"v{version}", version, f"{token}-{version}", f"{token}-v{version}"])
 
-        _, assets = get_github_release_assets(owner, repo, tags_to_try)
+        found_tag, assets = get_github_release_assets(owner, repo, tags_to_try)
         if assets:
             dl_url = pick_intel_mac_asset(assets, token=token, prefer_cli=True)
+            if dl_url and found_tag and found_tag not in tags_to_try:
+                version = found_tag.lstrip("v") or version
 
     # 2. Fallback to Homebrew Intel macOS bottle if available on ghcr.io
     is_bottle = False
     if not dl_url:
         bottle_files = data.get("bottle", {}).get("stable", {}).get("files", {})
-        for os_key in INTEL_OS_KEYS:
-            if os_key in bottle_files and "url" in bottle_files[os_key]:
-                dl_url = bottle_files[os_key]["url"]
+        for os_key in get_host_fallback_order():
+            entry = bottle_files.get(os_key)
+            if isinstance(entry, dict) and "url" in entry:
+                dl_url = entry["url"]
+                expected_sha256 = entry.get("sha256")
                 is_bottle = True
                 break
         if not dl_url:
             for k, v in bottle_files.items():
                 if not k.startswith("arm64") and "linux" not in k and isinstance(v, dict) and "url" in v:
                     dl_url = v["url"]
+                    expected_sha256 = v.get("sha256")
                     is_bottle = True
                     break
 
@@ -267,6 +378,7 @@ def get_formula_data(formula_name):
         "homepage": homepage,
         "version": version,
         "url": dl_url,
+        "sha256": expected_sha256,
         "artifacts": [{"binary": [token]}],
         "variations": {},
         "depends_on": {},
@@ -315,107 +427,171 @@ def get_cask_data(cask, prefer_cask=False, prefer_formula=False):
                     "artifacts": artifacts,
                     "variations": {},
                     "depends_on": {},
-                    "_is_formula": not is_gui
+                    "_is_formula": not is_gui,
+                    "_is_github_repo": True,
+                    "_tracker_key": f"{owner}/{repo}",
                 }
+        return None
 
-    # 1. If user explicitly requested --formula, check formula first
+    encoded = urllib.parse.quote(cask, safe="@")
+
+    # 1. Explicit --formula request: check Formula API only
     if prefer_formula:
-        formula_data = get_formula_data(cask)
-        if formula_data:
-            return formula_data
+        return get_formula_data(cask)
 
     # 2. Check standard Homebrew Cask API
-    cask_data = fetch_json(f"https://formulae.brew.sh/api/cask/{cask}.json")
+    cask_data = fetch_json(f"https://formulae.brew.sh/api/cask/{encoded}.json")
     if cask_data:
-        if prefer_cask:
-            return cask_data
         return cask_data
 
-    # 3. If user passed --cask (e.g. `cask install --cask opencode`), check `<name>-desktop` cask first
+    # 3. Explicit --cask request: check Cask variants only (do not silently install a formula)
     if prefer_cask:
-        for suffix in ("-desktop", "-app"):
+        for suffix in ("-desktop", "-app", "-cli"):
             if not cask.endswith(suffix):
-                alt_cask = fetch_json(f"https://formulae.brew.sh/api/cask/{cask}{suffix}.json")
+                alt_cask = fetch_json(f"https://formulae.brew.sh/api/cask/{urllib.parse.quote(cask + suffix, safe='@')}.json")
                 if alt_cask:
                     print(f"🔄 Resolved Cask '{cask}' -> '{cask}{suffix}'")
                     return alt_cask
+        return None
 
     # 4. Fallback to Homebrew Formula API (for CLI packages like `opencode`, `ripgrep`, `gh`, `uv`, etc.)
     formula_data = get_formula_data(cask)
     if formula_data:
         companion_cask = None
         for suffix in ("-desktop", "-app"):
-            if fetch_json(f"https://formulae.brew.sh/api/cask/{cask}{suffix}.json"):
+            if not cask.endswith(suffix) and fetch_json(f"https://formulae.brew.sh/api/cask/{urllib.parse.quote(cask + suffix, safe='@')}.json"):
                 companion_cask = f"{cask}{suffix}"
                 break
         if companion_cask:
             formula_data["_companion_cask"] = companion_cask
         return formula_data
 
-    # 5. Fallback to Cask name variants (`<name>-desktop`, `<name>-app`, or stripping `-desktop`/`-app`)
-    variant_candidates = [f"{cask}-desktop", f"{cask}-app", f"{cask}-cli"]
+    # 5. Fallback to Cask name variants (`<name>-desktop`, `<name>-app`, `<name>-cli`, or stripping them)
+    variant_candidates = []
     for suffix in ("-desktop", "-app", "-cli"):
-        if cask.endswith(suffix):
-            variant_candidates.append(cask[:-len(suffix)])
-    for candidate in variant_candidates:
-        alt_cask = fetch_json(f"https://formulae.brew.sh/api/cask/{candidate}.json")
+        if not cask.endswith(suffix):
+            variant_candidates.append(f"{cask}{suffix}")
+        else:
+            stripped = cask[:-len(suffix)]
+            if stripped:
+                variant_candidates.append(stripped)
+    for candidate in dict.fromkeys(variant_candidates):
+        alt_cask = fetch_json(f"https://formulae.brew.sh/api/cask/{urllib.parse.quote(candidate, safe='@')}.json")
         if alt_cask:
             print(f"🔄 Resolved '{cask}' -> Cask '{candidate}'")
             return alt_cask
 
     return None
 
-def get_intel_url_and_artifacts(data):
-    variations = data.get("variations", {})
-    artifacts = list(data.get("artifacts", []))
+def resolve_intel_cask(data, host_os=None):
+    """
+    Resolves Intel (x86_64) download URL, artifacts, version, sha256, depends_on,
+    url_specs, and arm64-only status following Homebrew's variations semantics.
+    """
+    host_os = host_os or get_host_macos_codename()
+    variations = data.get("variations") or {}
+    supported = data.get("supported_platforms") or []
+
+    chosen_var = None
+    if host_os in variations and isinstance(variations[host_os], dict):
+        chosen_var = variations[host_os]
+    else:
+        top_url = data.get("url")
+        top_arm_dep = is_arm_only_depends(data.get("depends_on"))
+        top_arm_url = is_arm_only_url(top_url)
+        host_in_supported = (host_os in supported) if supported else (host_os in MACOS_ORDER[:7])
+        if top_arm_dep or top_arm_url or not host_in_supported:
+            idx = MACOS_ORDER.index(host_os) if host_os in MACOS_ORDER else 0
+            fallback_keys = MACOS_ORDER[idx + 1:] + list(reversed(MACOS_ORDER[:idx])) + ["x86_64"]
+            for k in fallback_keys:
+                v = variations.get(k)
+                if isinstance(v, dict) and ("url" in v or "artifacts" in v):
+                    v_url = v.get("url", top_url)
+                    v_dep = v.get("depends_on", data.get("depends_on"))
+                    if not is_arm_only_url(v_url) and (not is_arm_only_depends(v_dep) or ("url" in v and not is_arm_only_url(v["url"]))):
+                        chosen_var = v
+                        break
+            if chosen_var is None:
+                for k, v in variations.items():
+                    if not k.startswith("arm64") and "linux" not in k and isinstance(v, dict) and ("url" in v or "artifacts" in v):
+                        v_url = v.get("url", top_url)
+                        if not is_arm_only_url(v_url):
+                            chosen_var = v
+                            break
+
     dl_url = data.get("url")
-    found_intel_variation = False
+    artifacts = list(data.get("artifacts", []))
+    version = data.get("version", "unknown")
+    sha256 = data.get("sha256")
+    depends_on = data.get("depends_on", {})
+    url_specs = data.get("url_specs", {})
 
-    for os_key in INTEL_OS_KEYS:
-        if os_key in variations and isinstance(variations[os_key], dict):
-            var_entry = variations[os_key]
-            if "url" in var_entry or "artifacts" in var_entry:
-                if "url" in var_entry:
-                    dl_url = var_entry["url"]
-                if "artifacts" in var_entry:
-                    artifacts = list(var_entry["artifacts"])
-                found_intel_variation = True
-                break
+    if chosen_var:
+        if "url" in chosen_var:
+            dl_url = chosen_var["url"]
+            # Never reuse top-level sha256 when variation points to a different URL
+            sha256 = chosen_var.get("sha256")
+        elif "sha256" in chosen_var:
+            sha256 = chosen_var["sha256"]
+        if "artifacts" in chosen_var:
+            artifacts = list(chosen_var["artifacts"])
+        if chosen_var.get("version"):
+            version = chosen_var["version"]
+        if "depends_on" in chosen_var:
+            depends_on = chosen_var["depends_on"]
+        if "url_specs" in chosen_var:
+            url_specs = chosen_var["url_specs"]
 
-    if not found_intel_variation:
-        for k, v in variations.items():
-            if not k.startswith("arm64") and "linux" not in k and isinstance(v, dict):
-                if "url" in v or "artifacts" in v:
-                    if "url" in v:
-                        dl_url = v["url"]
-                    if "artifacts" in v:
-                        artifacts = list(v["artifacts"])
-                    found_intel_variation = True
-                    break
+    arm_only = False
+    if chosen_var is None and (is_arm_only_depends(depends_on) or is_arm_only_url(dl_url)):
+        arm_only = True
+    elif chosen_var is not None and is_arm_only_url(dl_url):
+        arm_only = True
 
     # If the URL still points to an arm64-only asset on GitHub, check if an Intel asset exists in the same release
-    if dl_url and not found_intel_variation and re.search(r"(arm64|aarch64)", dl_url, re.I):
+    if dl_url and arm_only:
         gh_m = re.search(r"github\.com/([^/]+)/([^/]+)/releases/download/([^/]+)/", dl_url)
         if gh_m:
-            owner, repo, tag = gh_m.group(1), gh_m.group(2), gh_m.group(3)
+            owner, repo, tag = gh_m.group(1), gh_m.group(2), urllib.parse.unquote(gh_m.group(3))
             _, assets = get_github_release_assets(owner, repo, [tag])
             alt_url = pick_intel_mac_asset(assets, token=data.get("token", ""), prefer_cli=bool(data.get("_is_formula")))
             if alt_url:
                 dl_url = alt_url
+                sha256 = None
+                arm_only = False
 
-    return dl_url, artifacts
+    return {
+        "url": dl_url,
+        "artifacts": artifacts,
+        "version": version,
+        "sha256": sha256,
+        "depends_on": depends_on if isinstance(depends_on, dict) else {},
+        "url_specs": url_specs if isinstance(url_specs, dict) else {},
+        "arm_only": arm_only,
+    }
+
+def get_intel_url_and_artifacts(data):
+    resolved = resolve_intel_cask(data)
+    return (None if resolved["arm_only"] else resolved["url"]), resolved["artifacts"]
 
 def detect_kind(filepath):
-    # 1. Check if the server returned an HTML mirror page
+    # 1. Check if the server returned an HTML/XML mirror or error page
+    header = b""
+    tail = b""
     try:
+        size = os.path.getsize(filepath)
         with open(filepath, "rb") as f:
             header = f.read(512)
-        if header.lstrip().startswith((b"<!DOCTYPE", b"<!doctype", b"<html", b"<HTML", b"<?xml")):
+            if size >= 512:
+                f.seek(size - 512)
+                tail = f.read(512)
+        stripped = header.lstrip(b"\xef\xbb\xbf").lstrip().lower()
+        if stripped.startswith((b"<!doctype", b"<html", b"<head", b"<?xml")):
             return "html"
     except Exception:
-        header = b""
+        pass
 
-    # 2. Trust filename extensions first
+    # 2. Trust filename extensions first (prevents bzip2/xz-compressed .dmg from being treated as tar)
     lower = filepath.lower()
     if lower.endswith(".dmg"):
         return "dmg"
@@ -426,7 +602,9 @@ def detect_kind(filepath):
     if lower.endswith((".tar.gz", ".tgz", ".tar.bz2", ".tbz2", ".tar.xz", ".txz", ".tar")):
         return "tar"
 
-    # 3. Probe extensionless or redirect URLs (including ghcr.io bottle blobs)
+    # 3. Probe extensionless or redirect URLs (including ghcr.io bottle blobs & extensionless DMGs)
+    if tail.startswith(b"koly"):
+        return "dmg"
     if header.startswith(b"PK\x03\x04"):
         return "zip"
     if header.startswith(b"xar!"):
@@ -445,17 +623,41 @@ def detect_kind(filepath):
 
     return "binary"
 
-def is_macho_or_script(filepath):
-    if not os.path.isfile(filepath) or os.path.islink(filepath):
+def verify_sha256(filepath, expected_sha256):
+    if not expected_sha256 or not isinstance(expected_sha256, str):
+        return True, None
+    if not re.fullmatch(r"[0-9a-fA-F]{64}", expected_sha256.strip()):
+        return True, None
+    h = hashlib.sha256()
+    with open(filepath, "rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            h.update(chunk)
+    actual = h.hexdigest()
+    return actual.lower() == expected_sha256.strip().lower(), actual
+
+def is_macho(filepath, follow_symlinks=False):
+    if not follow_symlinks and os.path.islink(filepath):
+        return False
+    real = os.path.realpath(filepath) if follow_symlinks else filepath
+    if not os.path.isfile(real):
         return False
     try:
-        with open(filepath, "rb") as f:
+        with open(real, "rb") as f:
             magic = f.read(4)
-        if magic in (
-            b"\xcf\xfa\xed\xfe", b"\xfe\xed\xfa\xcf",
-            b"\xce\xfa\xed\xfe", b"\xfe\xed\xfa\xce",
-            b"\xca\xfe\xba\xbe", b"\xbe\xba\xfe\xca"
-        ):
+        return magic in MACHO_MAGICS
+    except Exception:
+        return False
+
+def is_macho_or_script(filepath, follow_symlinks=False):
+    if not follow_symlinks and os.path.islink(filepath):
+        return False
+    real = os.path.realpath(filepath) if follow_symlinks else filepath
+    if not os.path.isfile(real):
+        return False
+    try:
+        with open(real, "rb") as f:
+            magic = f.read(4)
+        if magic in MACHO_MAGICS:
             return True
         if magic.startswith(b"#!"):
             return True
@@ -463,10 +665,10 @@ def is_macho_or_script(filepath):
         pass
     return False
 
-def relocate_bottle(cask_dir):
+def relocate_bottle(cask_dir, token=""):
     """
     Rewrites @@HOMEBREW_CELLAR@@ and @@HOMEBREW_PREFIX@@ placeholders in Homebrew bottles
-    so they run standalone from /usr/local/Caskroom without Homebrew installed.
+    (including LC_ID_DYLIB, LC_LOAD_DYLIB, and LC_RPATH) so they run standalone from /usr/local/Caskroom.
     """
     opt_root = None
     for root, dirs, _ in os.walk(cask_dir):
@@ -476,43 +678,119 @@ def relocate_bottle(cask_dir):
     if not opt_root:
         opt_root = cask_dir
 
+    formula_name = token or os.path.basename(cask_dir)
+    missing_deps = set()
+
+    def rewrite_placeholder(dep):
+        new_dep = dep
+        m_cellar = re.match(r"@@HOMEBREW_CELLAR@@/([^/]+)/([^/]+)(/.*)?$", new_dep)
+        if m_cellar:
+            pkg, _, rest = m_cellar.group(1), m_cellar.group(2), m_cellar.group(3) or ""
+            if pkg == formula_name or os.path.exists(opt_root + rest):
+                return opt_root + rest
+            alt_caskroom = f"/usr/local/Caskroom/{pkg}"
+            if os.path.isdir(alt_caskroom):
+                for r, ds, _ in os.walk(alt_caskroom):
+                    if os.path.exists(r + rest):
+                        return r + rest
+            return new_dep.replace("@@HOMEBREW_CELLAR@@", "/usr/local/Cellar")
+
+        m_opt = re.match(r"@@HOMEBREW_PREFIX@@/opt/([^/]+)(/.*)?$", new_dep)
+        if m_opt:
+            dep_pkg, rest = m_opt.group(1), m_opt.group(2) or ""
+            if dep_pkg == formula_name or (rest and os.path.exists(opt_root + rest)):
+                return opt_root + rest
+            alt_caskroom = f"/usr/local/Caskroom/{dep_pkg}"
+            if rest and os.path.isdir(alt_caskroom):
+                for r, _, _ in os.walk(alt_caskroom):
+                    if os.path.exists(r + rest):
+                        return r + rest
+            candidate = new_dep.replace("@@HOMEBREW_PREFIX@@", "/usr/local")
+            if rest and not os.path.exists(candidate):
+                missing_deps.add((dep_pkg, candidate))
+            return candidate
+
+        return new_dep.replace("@@HOMEBREW_PREFIX@@", "/usr/local")
+
     for root, _, files in os.walk(cask_dir):
         for fname in files:
             fpath = os.path.join(root, fname)
             if os.path.islink(fpath) or not os.path.isfile(fpath):
                 continue
-            try:
-                with open(fpath, "rb") as f:
-                    head = f.read(4)
-            except Exception:
+            if not is_macho(fpath):
                 continue
 
-            if head in (
-                b"\xcf\xfa\xed\xfe", b"\xfe\xed\xfa\xcf",
-                b"\xca\xfe\xba\xbe", b"\xbe\xba\xfe\xca"
-            ):
-                otool = subprocess.run(["otool", "-L", fpath], capture_output=True, text=True)
-                if otool.returncode == 0 and "@@HOMEBREW_" in otool.stdout:
-                    try:
-                        os.chmod(fpath, 0o755)
-                    except Exception:
-                        pass
-                    changed = False
-                    for line in otool.stdout.splitlines()[1:]:
-                        dep = line.strip().split(" (compatibility ")[0].strip()
-                        if "@@HOMEBREW_" not in dep:
-                            continue
-                        new_dep = re.sub(r"@@HOMEBREW_CELLAR@@/[^/]+/[^/]+", opt_root, dep)
-                        new_dep = re.sub(r"@@HOMEBREW_PREFIX@@/opt/[^/]+", opt_root, new_dep)
-                        new_dep = new_dep.replace("@@HOMEBREW_PREFIX@@", "/usr/local")
-                        if new_dep != dep:
-                            subprocess.run(["install_name_tool", "-change", dep, new_dep, fpath], stderr=subprocess.DEVNULL)
-                            changed = True
-                    if changed:
-                        subprocess.run(["codesign", "-fs", "-", fpath], stderr=subprocess.DEVNULL)
+            otool_l = subprocess.run(["otool", "-L", fpath], capture_output=True, text=True)
+            otool_d = subprocess.run(["otool", "-D", fpath], capture_output=True, text=True)
+            otool_r = subprocess.run(["otool", "-l", fpath], capture_output=True, text=True)
+
+            dylib_id = ""
+            if otool_d.returncode == 0:
+                d_lines = [l.strip() for l in otool_d.stdout.splitlines()[1:] if l.strip()]
+                if d_lines:
+                    dylib_id = d_lines[0]
+
+            rpaths = []
+            if otool_r.returncode == 0 and "LC_RPATH" in otool_r.stdout:
+                lines = otool_r.stdout.splitlines()
+                for idx, line in enumerate(lines):
+                    if "cmd LC_RPATH" in line:
+                        for sub in lines[idx + 1:idx + 5]:
+                            m_rp = re.search(r"path\s+(.+?)\s+\(offset\s+\d+\)", sub)
+                            if m_rp and "@@HOMEBREW_" in m_rp.group(1):
+                                rpaths.append(m_rp.group(1).strip())
+                                break
+
+            has_placeholder = (
+                (otool_l.returncode == 0 and "@@HOMEBREW_" in otool_l.stdout)
+                or ("@@HOMEBREW_" in dylib_id)
+                or bool(rpaths)
+            )
+            if not has_placeholder:
+                continue
+
+            try:
+                os.chmod(fpath, 0o755)
+            except Exception:
+                pass
+
+            changed = False
+            if "@@HOMEBREW_" in dylib_id:
+                new_id = rewrite_placeholder(dylib_id)
+                if new_id != dylib_id:
+                    subprocess.run(["install_name_tool", "-id", new_id, fpath], stderr=subprocess.DEVNULL)
+                    changed = True
+
+            if otool_l.returncode == 0:
+                for line in otool_l.stdout.splitlines()[1:]:
+                    dep = line.strip().split(" (compatibility ")[0].strip()
+                    if "@@HOMEBREW_" not in dep or dep == dylib_id:
+                        continue
+                    new_dep = rewrite_placeholder(dep)
+                    if new_dep != dep:
+                        subprocess.run(["install_name_tool", "-change", dep, new_dep, fpath], stderr=subprocess.DEVNULL)
+                        changed = True
+
+            for rp in rpaths:
+                new_rp = rewrite_placeholder(rp)
+                if new_rp != rp:
+                    subprocess.run(["install_name_tool", "-rpath", rp, new_rp, fpath], stderr=subprocess.DEVNULL)
+                    changed = True
+
+            if changed:
+                subprocess.run(["codesign", "-fs", "-", fpath], stderr=subprocess.DEVNULL)
+
+    for dep_pkg, dep_path in sorted(missing_deps):
+        print(f"⚠️  Bottle binary links to external library '{dep_pkg}' ({dep_path}) which was not found locally.")
 
 def copy_app(src, dst):
-    print(f"📦 Installing {os.path.basename(dst)} to /Applications...")
+    print(f"📦 Installing {os.path.basename(dst)} to {os.path.dirname(dst)}...")
+    parent = os.path.dirname(dst)
+    if parent and not os.path.isdir(parent):
+        try:
+            os.makedirs(parent, exist_ok=True)
+        except PermissionError:
+            run_cmd(["sudo", "mkdir", "-p", parent])
     if os.path.lexists(dst):
         try:
             shutil.rmtree(dst) if os.path.isdir(dst) and not os.path.islink(dst) else os.remove(dst)
@@ -520,25 +798,123 @@ def copy_app(src, dst):
             run_cmd(["sudo", "rm", "-rf", dst])
     res = subprocess.run(["ditto", src, dst], stderr=subprocess.DEVNULL)
     if res.returncode != 0:
-        run_cmd(["sudo", "ditto", src, dst])
-    subprocess.run(["xattr", "-cr", dst], stderr=subprocess.DEVNULL)
-    run_cmd(["sudo", "xattr", "-cr", dst], stderr=subprocess.DEVNULL)
+        res = run_cmd(["sudo", "ditto", src, dst])
+    if res.returncode != 0 or not os.path.exists(dst):
+        print(f"❌ Failed to copy {os.path.basename(src)} to {dst}.")
+        return False
+    xres = subprocess.run(["xattr", "-cr", dst], stderr=subprocess.DEVNULL)
+    if xres.returncode != 0:
+        run_cmd(["sudo", "xattr", "-cr", dst], stderr=subprocess.DEVNULL)
+    return True
 
-def link_binary(src_path, target_name):
-    os.makedirs("/usr/local/bin", exist_ok=True)
-    dst_link = f"/usr/local/bin/{target_name}"
-    try:
-        os.chmod(src_path, 0o755)
-    except PermissionError:
-        run_cmd(["sudo", "chmod", "+x", src_path])
+def resolve_binary_target(items):
+    raw_target = None
+    if len(items) > 1 and isinstance(items[1], dict) and isinstance(items[1].get("target"), str):
+        raw_target = items[1]["target"]
+    if raw_target:
+        expanded = expand_cask_path(raw_target)
+        if os.path.isabs(expanded):
+            return expanded
+        return os.path.join("/usr/local/bin", os.path.basename(expanded))
+    return os.path.join("/usr/local/bin", os.path.basename(items[0]))
+
+def link_binary(src_path, dst_target):
+    dst_link = dst_target if os.path.isabs(dst_target) else f"/usr/local/bin/{dst_target}"
+    parent_dir = os.path.dirname(dst_link)
+    if parent_dir and not os.path.isdir(parent_dir):
+        try:
+            os.makedirs(parent_dir, exist_ok=True)
+        except PermissionError:
+            run_cmd(["sudo", "mkdir", "-p", parent_dir])
+
+    # Only mark executable when linking into a bin directory and not already executable
+    in_bin_target = os.path.basename(parent_dir) in ("bin", "sbin", "cli-plugins")
+    if in_bin_target and not os.access(src_path, os.X_OK):
+        try:
+            os.chmod(src_path, 0o755)
+        except PermissionError:
+            run_cmd(["sudo", "chmod", "+x", src_path])
+
     subprocess.run(["xattr", "-cr", src_path], stderr=subprocess.DEVNULL)
     print(f"🔗 Linking CLI binary: {dst_link} -> {src_path}")
     try:
         if os.path.lexists(dst_link):
-            os.remove(dst_link)
+            if os.path.isdir(dst_link) and not os.path.islink(dst_link):
+                shutil.rmtree(dst_link)
+            else:
+                os.remove(dst_link)
         os.symlink(src_path, dst_link)
+        return True
     except PermissionError:
-        run_cmd(["sudo", "ln", "-sf", src_path, dst_link])
+        if os.path.isdir(dst_link) and not os.path.islink(dst_link):
+            run_cmd(["sudo", "rm", "-rf", dst_link])
+        res = run_cmd(["sudo", "ln", "-sf", src_path, dst_link])
+        return res.returncode == 0
+
+def create_command_wrapper(dst_path, executable, args=None, env=None):
+    parent_dir = os.path.dirname(dst_path)
+    if parent_dir and not os.path.isdir(parent_dir):
+        try:
+            os.makedirs(parent_dir, exist_ok=True)
+        except PermissionError:
+            run_cmd(["sudo", "mkdir", "-p", parent_dir])
+
+    lines = ["#!/bin/sh"]
+    if isinstance(env, dict):
+        for k, v in env.items():
+            if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", str(k)):
+                lines.append(f"export {k}={shlex.quote(str(v))}")
+    cmd_parts = [shlex.quote(executable)] + [shlex.quote(str(a)) for a in to_list(args)]
+    lines.append(f"exec {' '.join(cmd_parts)} \"$@\"")
+    script_body = "\n".join(lines) + "\n"
+
+    print(f"🔗 Creating CLI wrapper: {dst_path} -> {executable}")
+    try:
+        if os.path.lexists(dst_path):
+            os.remove(dst_path)
+        with open(dst_path, "w") as f:
+            f.write(script_body)
+        os.chmod(dst_path, 0o755)
+        return True
+    except PermissionError:
+        with tempfile.NamedTemporaryFile("w", delete=False) as tf:
+            tf.write(script_body)
+            tmp_script = tf.name
+        try:
+            os.chmod(tmp_script, 0o755)
+            res = run_cmd(["sudo", "mv", "-f", tmp_script, dst_path])
+            return res.returncode == 0
+        finally:
+            if os.path.exists(tmp_script):
+                os.remove(tmp_script)
+
+def install_app_binaries_and_wrappers(artifacts):
+    installed_any = False
+    for artifact in artifacts:
+        if not isinstance(artifact, dict):
+            continue
+        if "binary" in artifact:
+            items = to_list(artifact["binary"])
+            if not items or not isinstance(items[0], str):
+                continue
+            raw_src = items[0]
+            if "$APPDIR" in raw_src or raw_src.startswith("/Applications/"):
+                real_src = expand_cask_path(raw_src)
+                if os.path.exists(real_src):
+                    if link_binary(real_src, resolve_binary_target(items)):
+                        installed_any = True
+        if "command_wrapper" in artifact:
+            items = to_list(artifact["command_wrapper"])
+            if len(items) >= 2 and isinstance(items[0], str) and isinstance(items[1], dict):
+                opts = items[1]
+                raw_exec = opts.get("executable")
+                if isinstance(raw_exec, str):
+                    real_exec = expand_cask_path(raw_exec)
+                    if os.path.exists(real_exec):
+                        dst_path = expand_cask_path(artifact["target"]) if isinstance(artifact.get("target"), str) else f"/usr/local/bin/{os.path.basename(items[0])}"
+                        if create_command_wrapper(dst_path, real_exec, args=opts.get("args"), env=opts.get("env")):
+                            installed_any = True
+    return installed_any
 
 def find_binaries_to_link(cask_dir, raw_src, target_name, is_formula=False):
     """
@@ -549,6 +925,7 @@ def find_binaries_to_link(cask_dir, raw_src, target_name, is_formula=False):
     if os.path.isfile(direct_cand):
         return [(direct_cand, target_name)]
 
+    cask_base_lower = os.path.basename(cask_dir.rstrip("/")).lower()
     rel_name = os.path.basename(raw_src)
     exact_bin_matches = []
     exact_other_matches = []
@@ -556,13 +933,21 @@ def find_binaries_to_link(cask_dir, raw_src, target_name, is_formula=False):
     all_executables = []
 
     for r, dirs, fs in os.walk(cask_dir):
-        dirs[:] = [d for d in dirs if not d.startswith(".") and d != "__MACOSX"]
+        dirs[:] = [
+            d for d in dirs
+            if not d.startswith(".")
+            and d != "__MACOSX"
+            and not d.lower().endswith(BUNDLE_DIR_EXTS)
+        ]
         rel_dir = os.path.relpath(r, cask_dir)
         parts = [] if rel_dir == "." else rel_dir.split(os.sep)
-        if any(p.lower() in EXCLUDED_BIN_DIRS for p in parts):
+        in_bin_dir = any(p.lower() == "bin" for p in parts)
+
+        # Avoid excluding top-level directory named after the formula itself (e.g. `fish/4.0/bin/fish`)
+        parts_to_check = parts[1:] if (parts and parts[0].lower() == cask_base_lower) else parts
+        if not in_bin_dir and any(p.lower() in EXCLUDED_BIN_DIRS for p in parts_to_check):
             continue
 
-        in_bin_dir = any(p.lower() == "bin" for p in parts)
         for fname in fs:
             if fname.startswith("."):
                 continue
@@ -574,13 +959,13 @@ def find_binaries_to_link(cask_dir, raw_src, target_name, is_formula=False):
             if fname == rel_name:
                 if in_bin_dir:
                     exact_bin_matches.append(fpath)
-                elif is_macho_or_script(fpath) or not lower_f.endswith(EXCLUDED_BIN_EXTS):
+                elif is_macho_or_script(fpath, follow_symlinks=True) or not lower_f.endswith(EXCLUDED_BIN_EXTS):
                     exact_other_matches.append(fpath)
 
             if lower_f.endswith(EXCLUDED_BIN_EXTS) or lower_f in ("license", "readme", "changelog", "copying", "authors", "notice"):
                 continue
 
-            if is_macho_or_script(fpath):
+            if is_macho_or_script(fpath, follow_symlinks=in_bin_dir):
                 if in_bin_dir:
                     bin_dir_executables.append(fpath)
                 all_executables.append(fpath)
@@ -592,145 +977,258 @@ def find_binaries_to_link(cask_dir, raw_src, target_name, is_formula=False):
 
     if exact_other_matches:
         if is_formula and len(all_executables) > 1:
-            return [(p, os.path.basename(p)) for p in all_executables]
+            match_dir = os.path.dirname(exact_other_matches[0])
+            siblings = [
+                p for p in all_executables
+                if os.path.dirname(p) == match_dir and not p.lower().endswith(".sh")
+            ]
+            if len(siblings) > 1:
+                return [(p, os.path.basename(p)) for p in siblings]
         return [(exact_other_matches[0], target_name)]
 
     if bin_dir_executables:
         return [(p, os.path.basename(p)) for p in bin_dir_executables]
 
-    if len(all_executables) == 1:
-        only_exe = all_executables[0]
+    # Outside bin/, prefer native Mach-O binaries over auxiliary .sh helper scripts (e.g. yq + install-man-page.sh)
+    macho_executables = [p for p in all_executables if is_macho(p)]
+    pool = macho_executables if macho_executables else all_executables
+
+    if len(pool) == 1:
+        only_exe = pool[0]
         exe_base = os.path.basename(only_exe)
-        if re.search(r"(darwin|macos|mac|osx|amd64|x86_64|x64|intel|universal)", exe_base, re.I):
+        if re.search(r"(darwin|macos|mac|osx|amd64|x86[-_]?64|x64|intel|universal)", exe_base, re.I):
             return [(only_exe, target_name)]
         return [(only_exe, exe_base if is_formula else target_name)]
 
-    if all_executables:
-        return [(p, os.path.basename(p)) for p in all_executables]
+    if pool:
+        return [(p, os.path.basename(p)) for p in pool]
 
     return []
 
-def install_extracted(search_dir, cask, artifacts, is_formula=False, is_bottle=False):
+def build_declared_app_map(artifacts):
+    """
+    Returns {src_app_basename_lower: dst_path} for declared `app` artifacts,
+    preserving Homebrew target renames (e.g. Bitcoin-Qt.app -> /Applications/Bitcoin Core.app).
+    """
+    app_map = {}
+    for artifact in artifacts:
+        if not isinstance(artifact, dict) or "app" not in artifact:
+            continue
+        items = to_list(artifact["app"])
+        if not items or not isinstance(items[0], str):
+            continue
+        src_base = os.path.basename(items[0]).lower()
+        dst_path = None
+        if isinstance(artifact.get("target"), str):
+            dst_path = expand_cask_path(artifact["target"])
+        elif len(items) > 1 and isinstance(items[1], dict) and isinstance(items[1].get("target"), str):
+            t = expand_cask_path(items[1]["target"])
+            dst_path = t if os.path.isabs(t) else f"/Applications/{os.path.basename(t)}"
+        else:
+            dst_path = f"/Applications/{os.path.basename(items[0])}"
+        app_map[src_base] = dst_path
+    return app_map
+
+def build_declared_pkg_set(artifacts):
+    pkgs = set()
+    for artifact in artifacts:
+        if isinstance(artifact, dict) and "pkg" in artifact:
+            for item in to_list(artifact["pkg"]):
+                if isinstance(item, str):
+                    pkgs.add(os.path.basename(item).lower())
+    return pkgs
+
+def install_extracted(search_dir, cask, artifacts, is_formula=False, is_bottle=False, is_github_repo=False, prefer_formula=False):
     installed_any = False
+    installed_gui_or_pkg = False
     staged_to_caskroom = False
 
+    declared_apps = build_declared_app_map(artifacts)
+    found_apps = []
     for root, dirs, files in os.walk(search_dir):
         dirs[:] = [d for d in dirs if not d.startswith(".") and d != "__MACOSX"]
         for d in list(dirs):
             if d.endswith(".app"):
-                if "uninstall" in d.lower():
-                    dirs.remove(d)
-                    continue
-                src = os.path.join(root, d)
-                dst = f"/Applications/{d}"
-                copy_app(src, dst)
-                installed_any = True
                 dirs.remove(d)
+                if "uninstall" in d.lower():
+                    continue
+                found_apps.append((os.path.join(root, d), d))
+
+    # Install declared app targets first (honoring renames); fall back to all non-uninstall .apps
+    matched_declared = [(src, declared_apps[name.lower()]) for src, name in found_apps if name.lower() in declared_apps]
+    apps_to_install = matched_declared if matched_declared else [(src, f"/Applications/{name}") for src, name in found_apps]
+    for src, dst in apps_to_install:
+        if copy_app(src, dst):
+            installed_any = True
+            installed_gui_or_pkg = True
 
     if not installed_any:
+        declared_pkgs = build_declared_pkg_set(artifacts)
+        found_pkgs = []
         for root, dirs, files in os.walk(search_dir):
             dirs[:] = [d for d in dirs if not d.startswith(".") and d != "__MACOSX"]
+            # Handle bundle-style .pkg / .mpkg directories
+            for d in list(dirs):
+                if d.lower().endswith((".pkg", ".mpkg")):
+                    dirs.remove(d)
+                    if "uninstall" in d.lower():
+                        continue
+                    found_pkgs.append((os.path.join(root, d), d))
+            # Handle flat .pkg / .mpkg files
             for f in files:
                 if f.lower().endswith((".pkg", ".mpkg")):
-                    pkg_path = os.path.join(root, f)
-                    print(f"📦 Running package installer for {f}...")
-                    res = run_cmd(["sudo", "installer", "-pkg", pkg_path, "-target", "/"])
-                    if res.returncode == 0:
-                        installed_any = True
+                    if "uninstall" in f.lower():
+                        continue
+                    found_pkgs.append((os.path.join(root, f), f))
 
+        matched_pkgs = [(p, n) for p, n in found_pkgs if n.lower() in declared_pkgs]
+        pkgs_to_install = matched_pkgs if matched_pkgs else found_pkgs
+        for pkg_path, pkg_name in pkgs_to_install:
+            print(f"📦 Running package installer for {pkg_name}...")
+            res = run_cmd(["sudo", "installer", "-pkg", pkg_path, "-target", "/"])
+            if res.returncode == 0:
+                installed_any = True
+                installed_gui_or_pkg = True
+
+    # Link $APPDIR binaries and command_wrappers
+    if install_app_binaries_and_wrappers(artifacts):
+        installed_any = True
+
+    # Link Caskroom-staged CLI binaries (skip synthetic owner/repo CLI fallback if a GUI app/pkg was installed)
     for artifact in artifacts:
         if isinstance(artifact, dict) and "binary" in artifact:
             items = to_list(artifact["binary"])
             if not items or not isinstance(items[0], str):
                 continue
             raw_src = items[0]
-            target_name = os.path.basename(raw_src)
-            if len(items) > 1 and isinstance(items[1], dict) and "target" in items[1]:
-                target_name = os.path.basename(items[1]["target"])
+            if "$APPDIR" in raw_src or raw_src.startswith("/Applications/"):
+                continue
+            if is_github_repo and installed_gui_or_pkg and not prefer_formula:
+                continue
 
-            if "$APPDIR/" in raw_src:
-                real_src = raw_src.replace("$APPDIR", "/Applications")
-                if os.path.exists(real_src):
-                    link_binary(real_src, target_name)
-                    installed_any = True
-            else:
-                cask_dir = f"/usr/local/Caskroom/{cask}"
-                if not staged_to_caskroom:
-                    if os.path.lexists(cask_dir):
-                        try:
-                            shutil.rmtree(cask_dir)
-                        except PermissionError:
-                            run_cmd(["sudo", "rm", "-rf", cask_dir])
+            dst_target = resolve_binary_target(items)
+            target_name = os.path.basename(dst_target)
+            cask_dir = f"/usr/local/Caskroom/{cask}"
+            if not staged_to_caskroom:
+                if os.path.lexists(cask_dir):
                     try:
-                        os.makedirs(cask_dir, exist_ok=True)
+                        if os.path.isdir(cask_dir) and not os.path.islink(cask_dir):
+                            shutil.rmtree(cask_dir)
+                        else:
+                            os.remove(cask_dir)
                     except PermissionError:
-                        run_cmd(["sudo", "mkdir", "-p", cask_dir])
-                        run_cmd(["sudo", "chown", "-R", f"{os.getuid()}:admin", cask_dir])
-                    subprocess.run(["ditto", search_dir, cask_dir])
-                    if is_bottle:
-                        relocate_bottle(cask_dir)
-                    staged_to_caskroom = True
+                        run_cmd(["sudo", "rm", "-rf", cask_dir])
+                try:
+                    os.makedirs(cask_dir, exist_ok=True)
+                except PermissionError:
+                    run_cmd(["sudo", "mkdir", "-p", cask_dir])
+                    run_cmd(["sudo", "chown", "-R", f"{os.getuid()}:admin", cask_dir])
+                dres = subprocess.run(["ditto", search_dir, cask_dir], stderr=subprocess.DEVNULL)
+                if dres.returncode != 0:
+                    dres = run_cmd(["sudo", "ditto", search_dir, cask_dir])
+                if dres.returncode != 0:
+                    print(f"❌ Failed to stage files into {cask_dir}.")
+                    continue
+                if is_bottle:
+                    relocate_bottle(cask_dir, token=cask)
+                staged_to_caskroom = True
 
-                pairs = find_binaries_to_link(cask_dir, raw_src, target_name, is_formula=is_formula)
-                for src_bin_path, link_name in pairs:
-                    link_binary(src_bin_path, link_name)
+            pairs = find_binaries_to_link(cask_dir, raw_src, target_name, is_formula=is_formula)
+            custom_non_bin_dir = (os.path.dirname(os.path.normpath(dst_target)) != "/usr/local/bin")
+            for src_bin_path, link_name in pairs:
+                link_dst = dst_target if (len(pairs) == 1 and custom_non_bin_dir) else f"/usr/local/bin/{link_name}"
+                if link_binary(src_bin_path, link_dst):
                     installed_any = True
 
     return installed_any
 
-def download_file(url, out_path):
-    cmd = ["curl", "-fL#", "--compressed", "-A", CLI_USER_AGENT]
+def download_file(url, out_path, url_specs=None):
+    ua = CLI_USER_AGENT
+    specs = url_specs if isinstance(url_specs, dict) else {}
+    spec_ua = specs.get("user_agent")
+    if isinstance(spec_ua, str):
+        if spec_ua in (":fake", ":browser"):
+            ua = BROWSER_USER_AGENT
+        elif spec_ua != ":curl" and not spec_ua.startswith(":"):
+            ua = spec_ua
+
+    cmd = ["curl", "-fL#", "--compressed", "-A", ua]
+    if isinstance(specs.get("referer"), str) and specs["referer"]:
+        cmd += ["-e", specs["referer"]]
+    if isinstance(specs.get("cookies"), dict) and specs["cookies"]:
+        cookie_str = "; ".join(f"{k}={v}" for k, v in specs["cookies"].items())
+        cmd += ["-b", cookie_str]
     if "ghcr.io/" in url:
         cmd += ["-H", "Authorization: Bearer QQ=="]
     cmd += [url, "-o", out_path]
     return run_cmd(cmd)
 
-def is_already_installed(cask, artifacts):
+def is_already_installed(cask, artifacts, tracker_key=None):
     """
     Checks if a cask or formula is already installed via /Applications bundle,
-    CLI link in /usr/local/bin, /usr/local/Caskroom, or tracker.
+    CLI link, /usr/local/Caskroom, or tracker.
     """
-    has_app_or_bin_artifact = False
+    has_app_artifact = any(isinstance(a, dict) and "app" in a for a in artifacts)
+    has_app_or_bin_artifact = has_app_artifact
 
     for artifact in artifacts:
-        if isinstance(artifact, dict):
-            if "app" in artifact:
-                has_app_or_bin_artifact = True
-                for item in to_list(artifact["app"]):
-                    app_name = item.get("target") if isinstance(item, dict) else (item if isinstance(item, str) else None)
-                    if app_name:
-                        app_base = os.path.basename(app_name)
-                        for d in ("/Applications", os.path.expanduser("~/Applications")):
-                            cand = os.path.join(d, app_base)
-                            if os.path.exists(cand):
-                                return True, cand
-            if "target" in artifact and isinstance(artifact["target"], str):
-                has_app_or_bin_artifact = True
-                target_cand = artifact["target"].replace("$APPDIR", "/Applications").replace("$HOMEBREW_PREFIX", "/usr/local")
+        if not isinstance(artifact, dict):
+            continue
+
+        if "app" in artifact:
+            if isinstance(artifact.get("target"), str):
+                target_cand = expand_cask_path(artifact["target"])
                 if os.path.exists(target_cand):
                     return True, target_cand
+            for item in to_list(artifact["app"]):
+                if isinstance(item, dict) and isinstance(item.get("target"), str):
+                    t = expand_cask_path(item["target"])
+                    cands = [t] if os.path.isabs(t) else [
+                        os.path.join("/Applications", os.path.basename(t)),
+                        os.path.join(os.path.expanduser("~/Applications"), os.path.basename(t)),
+                    ]
+                    for cand in cands:
+                        if os.path.exists(cand):
+                            return True, cand
+                elif isinstance(item, str):
+                    app_base = os.path.basename(item)
+                    for d in ("/Applications", os.path.expanduser("~/Applications")):
+                        cand = os.path.join(d, app_base)
+                        if os.path.exists(cand):
+                            return True, cand
 
-            if "binary" in artifact:
-                has_app_or_bin_artifact = True
-                items = to_list(artifact["binary"])
-                if items and isinstance(items[0], str):
-                    target_name = os.path.basename(items[0])
-                    if len(items) > 1 and isinstance(items[1], dict) and "target" in items[1]:
-                        target_name = os.path.basename(items[1]["target"])
-                    bin_cand = f"/usr/local/bin/{target_name}"
-                    if os.path.exists(bin_cand):
-                        return True, bin_cand
+        # For GUI app casks, don't treat leftover wrapper/binary links as installed if the .app is gone
+        if has_app_artifact:
+            continue
 
-    cask_dir = f"/usr/local/Caskroom/{cask}"
-    if os.path.isdir(cask_dir) and os.listdir(cask_dir):
-        return True, cask_dir
+        if "binary" in artifact:
+            has_app_or_bin_artifact = True
+            items = to_list(artifact["binary"])
+            if items and isinstance(items[0], str):
+                bin_cand = resolve_binary_target(items)
+                if os.path.exists(bin_cand):
+                    return True, bin_cand
+
+        if "command_wrapper" in artifact:
+            has_app_or_bin_artifact = True
+            if isinstance(artifact.get("target"), str):
+                wrapper_cand = expand_cask_path(artifact["target"])
+                if os.path.exists(wrapper_cand):
+                    return True, wrapper_cand
+
+    if not has_app_artifact:
+        cask_dir = f"/usr/local/Caskroom/{cask}"
+        if os.path.isdir(cask_dir) and os.listdir(cask_dir):
+            return True, cask_dir
 
     tracker = os.path.expanduser("~/.installed_casks.txt")
     if not has_app_or_bin_artifact and os.path.exists(tracker):
         with open(tracker, "r") as f:
             existing = [line.strip() for line in f if line.strip()]
-        if cask in existing:
-            return True, f"recorded in {tracker}"
+        keys = [k for k in (tracker_key, cask) if k]
+        for k in keys:
+            if k in existing:
+                return True, f"recorded in {tracker}"
 
     return False, ""
 
@@ -745,61 +1243,91 @@ def record_cask_installed(cask):
         with open(tracker, "w") as f:
             f.write("\n".join(existing) + "\n")
 
-def install_cask(cask_arg, force=False, prefer_cask=False, prefer_formula=False):
+def make_download_filename(url, fallback):
+    path_part = urllib.parse.urlparse(url).path
+    raw_name = urllib.parse.unquote(path_part.rstrip("/").split("/")[-1]) if path_part else ""
+    raw_name = os.path.basename(raw_name)
+    if not raw_name or raw_name in (".", ".."):
+        raw_name = f"{fallback}_dl"
+    if raw_name.startswith("sha256:"):
+        raw_name = f"{fallback}.tar.gz"
+    return raw_name
+
+def install_cask(cask_arg, force=False, prefer_cask=False, prefer_formula=False, _seen=None):
+    seen = set(_seen) if _seen else set()
+    if cask_arg in seen:
+        return True
+    seen.add(cask_arg)
+
     data = get_cask_data(cask_arg, prefer_cask=prefer_cask, prefer_formula=prefer_formula)
     if not data:
         print(f"❌ Could not find Cask or Formula '{cask_arg}'.")
         return False
 
     cask = data.get("token", cask_arg)
+    seen.add(cask)
+    tracker_key = data.get("_tracker_key", cask)
     is_formula = bool(data.get("_is_formula"))
     is_bottle = bool(data.get("_is_bottle"))
+    is_github_repo = bool(data.get("_is_github_repo"))
     companion_cask = data.get("_companion_cask")
 
+    resolved = resolve_intel_cask(data)
+    dl_url = resolved["url"]
+    artifacts = resolved["artifacts"]
+    version = resolved["version"]
+    expected_sha256 = resolved["sha256"]
+    depends_on = resolved["depends_on"]
+    url_specs = resolved["url_specs"]
+    arm_only = resolved["arm_only"]
+
     if is_formula:
-        print(f"📦 Resolved '{cask}' via Homebrew Formula ({data.get('version', 'latest')}).")
+        print(f"📦 Resolved '{cask}' via Homebrew Formula ({version}).")
         if companion_cask:
             print(f"💡 Tip: Desktop GUI app is also available via 'cask install {companion_cask}'.")
 
-    dl_url, artifacts = get_intel_url_and_artifacts(data)
-
     if not force:
-        installed, reason = is_already_installed(cask, artifacts)
+        installed, reason = is_already_installed(cask, artifacts, tracker_key=tracker_key)
         if installed:
             print(f"⚠️  '{cask}' is already installed ({reason}).")
-            print(f"👉 Use 'cask reinstall {cask}' or add '--force' to reinstall.\n")
+            print(f"👉 Use 'cask reinstall {tracker_key}' or add '--force' to reinstall.\n")
             if not cask_arg.endswith(".rb"):
-                record_cask_installed(cask)
+                record_cask_installed(tracker_key)
             return True
+
+    if arm_only:
+        print(f"❌ '{cask}' is Apple Silicon (arm64) only — no Intel (x86_64) build available.")
+        return False
 
     if not dl_url:
         print(f"❌ No Intel/Universal download URL found for '{cask}'.")
         return False
 
-    top_deps = data.get("depends_on", {})
-    if isinstance(top_deps, dict) and "cask" in top_deps:
-        for dep in to_list(top_deps["cask"]):
-            print(f"🔄 Checking dependency cask: {dep}...")
-            install_cask(dep, force=False)
+    if isinstance(depends_on, dict) and "cask" in depends_on:
+        for dep in to_list(depends_on["cask"]):
+            if isinstance(dep, str) and dep not in seen:
+                print(f"🔄 Checking dependency cask: {dep}...")
+                install_cask(dep, force=False, prefer_cask=True, _seen=seen)
     for artifact in artifacts:
-        if isinstance(artifact, dict) and "depends_on" in artifact:
+        if isinstance(artifact, dict) and "depends_on" in artifact and isinstance(artifact["depends_on"], dict):
             deps = artifact["depends_on"].get("cask", [])
             for dep in to_list(deps):
-                print(f"🔄 Checking dependency cask: {dep}...")
-                install_cask(dep, force=False)
+                if isinstance(dep, str) and dep not in seen:
+                    print(f"🔄 Checking dependency cask: {dep}...")
+                    install_cask(dep, force=False, prefer_cask=True, _seen=seen)
 
-    print(f"⬇️  Downloading '{cask}' from:\n   {dl_url}")
-    tmp_dir = tempfile.mkdtemp(prefix=f"cask_{cask}_")
-    raw_name = dl_url.split("?")[0].rstrip("/").split("/")[-1] or f"{cask}_dl"
-    if raw_name.startswith("sha256:"):
-        raw_name = f"{cask}.tar.gz"
+    print(f"⬇️  Downloading '{cask}' ({version}) from:\n   {dl_url}")
+    safe_prefix = re.sub(r"[^A-Za-z0-9._+-]", "_", cask)
+    tmp_dir = tempfile.mkdtemp(prefix=f"cask_{safe_prefix}_")
+    raw_name = make_download_filename(dl_url, safe_prefix)
     dl_path = os.path.join(tmp_dir, raw_name)
 
     mount_point = None
+    dev_entry = None
     installed_successfully = False
 
     try:
-        res = download_file(dl_url, dl_path)
+        res = download_file(dl_url, dl_path, url_specs=url_specs)
         if res.returncode != 0 or not os.path.exists(dl_path):
             print(f"❌ Failed to download '{cask}'.")
             return False
@@ -813,31 +1341,60 @@ def install_cask(cask_arg, force=False, prefer_cask=False, prefer_formula=False)
                 html_text = f.read()
 
             meta_m = re.search(r'URL=[\'"]?([^\'">\s]+)', html_text, re.IGNORECASE)
-            href_m = re.findall(r'href=["\x27](https?://[^"\x27]+\.(?:dmg|pkg|zip|tar\.gz|tgz|tar\.xz))["\x27]', html_text)
+            href_m = re.findall(r'href=["\x27](https?://[^"\x27]+\.(?:dmg|pkg|mpkg|zip|tar\.gz|tgz|tar\.xz|tar\.bz2))["\x27]', html_text, re.IGNORECASE)
 
             resolved_url = meta_m.group(1) if meta_m else (href_m[0] if href_m else None)
             if resolved_url:
+                resolved_url = urllib.parse.urljoin(dl_url, html.unescape(resolved_url))
                 print(f"⬇️  Redirecting to: {resolved_url}")
                 os.remove(dl_path)
-                res = download_file(resolved_url, dl_path)
+                raw_name = make_download_filename(resolved_url, safe_prefix)
+                dl_path = os.path.join(tmp_dir, raw_name)
+                res = download_file(resolved_url, dl_path, url_specs=url_specs)
+                if res.returncode != 0 or not os.path.exists(dl_path):
+                    print(f"❌ Failed to download redirected file for '{cask}'.")
+                    return False
                 kind = detect_kind(dl_path)
+                if kind == "html":
+                    print("❌ Redirect URL still served an HTML page instead of an installer/binary.")
+                    return False
             else:
                 print("❌ Download URL served an HTML landing page without a binary link.")
                 return False
 
+        # Verify SHA-256 checksum when provided by Homebrew metadata
+        sha_ok, actual_sha = verify_sha256(dl_path, expected_sha256)
+        if not sha_ok:
+            print(f"❌ SHA-256 checksum mismatch for '{cask}'!")
+            print(f"   Expected: {expected_sha256}")
+            print(f"   Actual:   {actual_sha}")
+            return False
+
         if kind == "dmg":
             print("💿 Mounting DMG...")
+            hdi_env = dict(os.environ)
+            hdi_env["PAGER"] = "cat"
             attach_res = subprocess.run(
                 ["hdiutil", "attach", "-nobrowse", "-readonly", "-plist", dl_path],
                 input=b"Y\n",
-                capture_output=True
+                capture_output=True,
+                env=hdi_env,
             )
             if attach_res.returncode == 0:
                 try:
-                    plist_data = plistlib.loads(attach_res.stdout)
+                    raw_out = attach_res.stdout
+                    xml_idx = raw_out.find(b"<?xml")
+                    if xml_idx == -1:
+                        xml_idx = raw_out.find(b"<plist")
+                    plist_bytes = raw_out[xml_idx:] if xml_idx != -1 else raw_out
+                    plist_data = plistlib.loads(plist_bytes)
                     for entity in plist_data.get("system-entities", []):
+                        if not dev_entry and entity.get("dev-entry"):
+                            dev_entry = entity["dev-entry"]
                         if "mount-point" in entity:
                             mount_point = entity["mount-point"]
+                            if entity.get("dev-entry"):
+                                dev_entry = entity["dev-entry"]
                             break
                 except Exception:
                     mount_point = None
@@ -845,32 +1402,54 @@ def install_cask(cask_arg, force=False, prefer_cask=False, prefer_formula=False)
             if not mount_point or not os.path.exists(mount_point):
                 mount_root = os.path.join(tmp_dir, "mnt")
                 os.makedirs(mount_root, exist_ok=True)
-                subprocess.run(
+                fb_res = subprocess.run(
                     ["hdiutil", "attach", "-nobrowse", "-readonly", "-mountrandom", mount_root, dl_path],
                     input=b"Y\n",
                     stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL
+                    stderr=subprocess.DEVNULL,
+                    env=hdi_env,
                 )
-                for entry in os.listdir(mount_root):
-                    cand = os.path.join(mount_root, entry)
-                    if os.path.isdir(cand):
-                        mount_point = cand
-                        break
-                if not mount_point:
-                    mount_point = mount_root
+                if fb_res.returncode == 0:
+                    for entry in os.listdir(mount_root):
+                        cand = os.path.join(mount_root, entry)
+                        if os.path.isdir(cand):
+                            mount_point = cand
+                            break
 
-            installed_successfully = install_extracted(mount_point, cask, artifacts, is_formula=is_formula, is_bottle=is_bottle)
+            if not mount_point or not os.path.exists(mount_point):
+                print(f"❌ Failed to mount DMG for '{cask}'.")
+                return False
+
+            installed_successfully = install_extracted(
+                mount_point, cask, artifacts,
+                is_formula=is_formula, is_bottle=is_bottle,
+                is_github_repo=is_github_repo, prefer_formula=prefer_formula,
+            )
         elif kind == "zip":
             extract_dir = os.path.join(tmp_dir, "extracted")
             print("📂 Extracting ZIP archive...")
-            subprocess.run(["ditto", "-x", "-k", dl_path, extract_dir])
-            installed_successfully = install_extracted(extract_dir, cask, artifacts, is_formula=is_formula, is_bottle=is_bottle)
+            ext_res = subprocess.run(["ditto", "-x", "-k", dl_path, extract_dir])
+            if ext_res.returncode != 0:
+                print(f"❌ Failed to extract ZIP archive for '{cask}'.")
+                return False
+            installed_successfully = install_extracted(
+                extract_dir, cask, artifacts,
+                is_formula=is_formula, is_bottle=is_bottle,
+                is_github_repo=is_github_repo, prefer_formula=prefer_formula,
+            )
         elif kind == "tar":
             extract_dir = os.path.join(tmp_dir, "extracted")
             os.makedirs(extract_dir, exist_ok=True)
             print("📂 Extracting TAR archive...")
-            subprocess.run(["tar", "-xf", dl_path, "-C", extract_dir])
-            installed_successfully = install_extracted(extract_dir, cask, artifacts, is_formula=is_formula, is_bottle=is_bottle)
+            ext_res = subprocess.run(["tar", "-xf", dl_path, "-C", extract_dir])
+            if ext_res.returncode != 0:
+                print(f"❌ Failed to extract TAR archive for '{cask}'.")
+                return False
+            installed_successfully = install_extracted(
+                extract_dir, cask, artifacts,
+                is_formula=is_formula, is_bottle=is_bottle,
+                is_github_repo=is_github_repo, prefer_formula=prefer_formula,
+            )
         elif kind == "pkg":
             pkg_file = dl_path if dl_path.lower().endswith((".pkg", ".mpkg")) else dl_path + ".pkg"
             if pkg_file != dl_path:
@@ -878,20 +1457,30 @@ def install_cask(cask_arg, force=False, prefer_cask=False, prefer_formula=False)
             print("📦 Running PKG installer...")
             pkg_res = run_cmd(["sudo", "installer", "-pkg", pkg_file, "-target", "/"])
             installed_successfully = (pkg_res.returncode == 0)
+            if installed_successfully:
+                install_app_binaries_and_wrappers(artifacts)
         elif kind == "binary":
             extract_dir = os.path.join(tmp_dir, "bin_stage")
             os.makedirs(extract_dir, exist_ok=True)
             shutil.move(dl_path, os.path.join(extract_dir, raw_name))
-            installed_successfully = install_extracted(extract_dir, cask, artifacts, is_formula=is_formula, is_bottle=is_bottle)
+            installed_successfully = install_extracted(
+                extract_dir, cask, artifacts,
+                is_formula=is_formula, is_bottle=is_bottle,
+                is_github_repo=is_github_repo, prefer_formula=prefer_formula,
+            )
 
     finally:
-        if mount_point:
-            subprocess.run(["hdiutil", "detach", mount_point, "-quiet", "-force"], stderr=subprocess.DEVNULL)
+        detached = False
+        if mount_point and os.path.exists(mount_point):
+            dres = subprocess.run(["hdiutil", "detach", mount_point, "-quiet", "-force"], stderr=subprocess.DEVNULL)
+            detached = (dres.returncode == 0)
+        if not detached and dev_entry:
+            subprocess.run(["hdiutil", "detach", dev_entry, "-quiet", "-force"], stderr=subprocess.DEVNULL)
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
     if installed_successfully:
         if not cask_arg.endswith(".rb"):
-            record_cask_installed(cask)
+            record_cask_installed(tracker_key)
         print(f"✅ Successfully installed '{cask}'!\n")
         return True
     else:
@@ -901,52 +1490,59 @@ def install_cask(cask_arg, force=False, prefer_cask=False, prefer_formula=False)
 def cleanup_cache():
     print("🧹 Cleaning up temporary download directories and orphaned caches...")
     cleaned = 0
-    temp_dir = tempfile.gettempdir()
-    for entry in glob.glob(os.path.join(temp_dir, "cask_*")):
-        try:
-            if os.path.isdir(entry):
-                shutil.rmtree(entry, ignore_errors=True)
-            else:
-                os.remove(entry)
-            cleaned += 1
-        except Exception:
-            pass
-    for entry in glob.glob("/tmp/cask_*"):
-        try:
-            if os.path.isdir(entry):
-                shutil.rmtree(entry, ignore_errors=True)
-            else:
-                os.remove(entry)
-            cleaned += 1
-        except Exception:
-            pass
+    scan_dirs = list(dict.fromkeys([
+        os.path.realpath(tempfile.gettempdir()),
+        os.path.realpath("/tmp"),
+    ]))
+    for base_dir in scan_dirs:
+        for entry in glob.glob(os.path.join(base_dir, "cask_*")):
+            try:
+                mnt_dir = os.path.join(entry, "mnt")
+                if os.path.isdir(mnt_dir):
+                    for sub in os.listdir(mnt_dir):
+                        sub_path = os.path.join(mnt_dir, sub)
+                        if os.path.ismount(sub_path):
+                            subprocess.run(["hdiutil", "detach", sub_path, "-quiet", "-force"], stderr=subprocess.DEVNULL)
+                if os.path.isdir(entry) and not os.path.islink(entry):
+                    shutil.rmtree(entry, ignore_errors=True)
+                else:
+                    os.remove(entry)
+                if not os.path.lexists(entry):
+                    cleaned += 1
+            except Exception:
+                pass
     print(f"✨ Cleanup complete! Removed {cleaned} temporary cask file(s)/folder(s).\n")
 
 def info_cask(cask_arg, prefer_cask=False, prefer_formula=False):
     data = get_cask_data(cask_arg, prefer_cask=prefer_cask, prefer_formula=prefer_formula)
     if not data:
         print(f"❌ Could not find Cask or Formula '{cask_arg}'.")
-        return
-    dl_url, _ = get_intel_url_and_artifacts(data)
+        return False
+    resolved = resolve_intel_cask(data)
     names = ", ".join(data.get("name", [cask_arg]))
     kind_label = "Formula" if data.get("_is_formula") else "Cask"
-    print(f"📌 {data.get('token', cask_arg)} ({data.get('version', 'unknown')}) [{kind_label}]")
+    print(f"📌 {data.get('token', cask_arg)} ({resolved['version']}) [{kind_label}]")
     print(f"   Name:     {names}")
     print(f"   Desc:     {data.get('desc', 'N/A')}")
     print(f"   Homepage: {data.get('homepage', 'N/A')}")
-    print(f"   Intel DL: {dl_url}")
+    if resolved["arm_only"]:
+        print("   Intel DL: None (Apple Silicon / arm64 only)")
+    else:
+        print(f"   Intel DL: {resolved['url']}")
     if data.get("_companion_cask"):
         print(f"   GUI Cask: {data['_companion_cask']} (run 'cask install {data['_companion_cask']}')")
+    return True
 
 def print_usage():
     print("Usage:")
-    print("  cask install [--force] <app_or_formula ...>  Install GUI Casks, CLI Formulae, GitHub repos, or .rb files")
-    print("  cask reinstall <app1> [app2 ...]             Reinstall packages even if already installed")
-    print("  cask zap <app1> [app2 ...]                   Completely uninstall apps, CLI binaries, and Library files")
-    print("  cask info <app>                              Show version and Intel download URL for a Cask or Formula")
-    print("  cask list                                    List all tracked packages in ~/.installed_casks.txt")
-    print("  cask upgrade-all                             Reinstall/update all tracked packages to latest")
-    print("  cask cleanup                                 Clean up leftover temporary download directories")
+    print("  cask install [--force] [--cask|--formula] <pkg ...>  Install GUI Casks, CLI Formulae, GitHub repos, or .rb files")
+    print("  cask reinstall [--cask|--formula] <pkg ...>          Reinstall packages even if already installed")
+    print("  cask upgrade [--cask|--formula] <pkg ...>            Upgrade specified packages to latest")
+    print("  cask zap [--cask|--formula] <pkg ...>                Completely uninstall apps, CLI binaries, and Library files")
+    print("  cask info [--cask|--formula] <pkg ...>               Show version and Intel download URL for a Cask or Formula")
+    print("  cask list                                            List all tracked packages in ~/.installed_casks.txt")
+    print("  cask upgrade-all                                     Reinstall/update all tracked packages to latest")
+    print("  cask cleanup                                         Clean up leftover temporary download directories")
 
 def main():
     if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help", "help"):
@@ -976,12 +1572,18 @@ def main():
         sys.exit(0)
 
     if action == "info":
-        prefer_cask = "--cask" in args
-        prefer_formula = "--formula" in args
-        targets = [a for a in args if a not in ("--cask", "--formula")]
+        prefer_cask = any(a in ("--cask", "--casks") for a in args)
+        prefer_formula = any(a in ("--formula", "--formulae") for a in args)
+        targets = [a for a in args if a not in ("--cask", "--casks", "--formula", "--formulae")]
+        if not targets:
+            print("❌ Please specify at least one package for info.")
+            print_usage()
+            sys.exit(1)
+        success_all = True
         for a in targets:
-            info_cask(a, prefer_cask=prefer_cask, prefer_formula=prefer_formula)
-        sys.exit(0)
+            if not info_cask(a, prefer_cask=prefer_cask, prefer_formula=prefer_formula):
+                success_all = False
+        sys.exit(0 if success_all else 1)
 
     if action == "upgrade-all":
         tracker = os.path.expanduser("~/.installed_casks.txt")
@@ -990,8 +1592,17 @@ def main():
             sys.exit(0)
         with open(tracker, "r") as f:
             all_apps = [line.strip() for line in f if line.strip()]
+        succeeded = 0
+        failed = []
         for app in all_apps:
-            install_cask(app, force=True)
+            if install_cask(app, force=True):
+                succeeded += 1
+            else:
+                failed.append(app)
+        if failed:
+            print(f"⚠️  Upgrade complete: {succeeded} succeeded, {len(failed)} failed ({', '.join(failed)}).")
+            sys.exit(1)
+        print(f"✅ Upgrade complete: {succeeded} package(s) updated.")
         sys.exit(0)
 
     if action in ("install", "reinstall", "upgrade"):
